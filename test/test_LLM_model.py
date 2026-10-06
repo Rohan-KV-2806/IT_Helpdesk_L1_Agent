@@ -1,36 +1,19 @@
 from llama_cpp import Llama
 
 llm = Llama(
-    model_path="models/Qwen_Qwen3-0.6B-Q4_K_M.gguf",
+    model_path="LocalLLMs/Qwen_Qwen3-0.6B-Q4_K_M.gguf",
     n_ctx=3096,
     n_threads=2,
     verbose=False
 )
 
-prompt = """Classify this IT support request.
-
-Choose exactly ONE category:
-INTERNET
-VPN
-EMAIL
-PRINTER
-OTHER
-
-Rules:
-- Return ONLY the category name.
-- Do not explain your answer.
-- Do not repeat the user's message.
-- Do not output punctuation.
-
-User request:
-"There seems to be a problem with my mail."
-"""
+prompt = "HEy there seems to be a problem with my internt its not visible like dont have the option to connect internet"
 
 response = llm.create_chat_completion(
     messages=[
         {
             "role": "system",
-            "content": "You are an IT Helpdesk L1 classification agent. Follow the user's classification instructions exactly."
+            "content": "You are an IT Helpdesk L1 agent. Understand the user's request and give a solution."
         },
         {
             "role": "user",

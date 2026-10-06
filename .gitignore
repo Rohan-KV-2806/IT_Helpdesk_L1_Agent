@@ -1,2 +1,5 @@
 .venv/
-models/
+LocalLLMs/
+ClassifierModels/
+__pycache__/
+*.pyc
