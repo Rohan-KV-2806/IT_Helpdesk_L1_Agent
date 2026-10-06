@@ -1,0 +1,10 @@
+{
+  "ticket_id": "TKT-20261006-172252-882",
+  "created_at": "2026-10-06T17:22:52",
+  "category": "INTERNET_CONNECTIVITY",
+  "priority": "Medium",
+  "summary": "There is something wrong with my internet.",
+  "triage_reason": "The agent could not produce a safe structured decision.",
+  "diagnostic_history": [],
+  "status": "Open"
+}

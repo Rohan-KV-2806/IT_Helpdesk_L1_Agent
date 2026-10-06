@@ -1,0 +1,16 @@
+{
+  "ticket_id": "TKT-20261006-164748-185",
+  "created_at": "2026-10-06T16:47:48",
+  "category": "INTERNET_CONNECTIVITY",
+  "priority": "Medium",
+  "summary": "There is something wrong with my internet.",
+  "triage_reason": "The agent could not produce a safe structured decision.",
+  "diagnostic_history": [
+    {
+      "tool": "check_ip_config",
+      "success": true,
+      "output": "Windows IP Configuration\n\n   Host Name . . . . . . . . . . . . : AMA010\n   Primary Dns Suffix  . . . . . . . : \n   Node Type . . . . . . . . . . . . : Hybrid\n   IP Routing Enabled. . . . . . . . : No\n   WINS Proxy Enabled. . . . . . . . : No\n\nEthernet adapter Ethernet:\n\n   Media State . . . . . . . . . . . : Media disconnected\n   Connection-specific DNS Suffix  . : \n   Description . . . . . . . . . . . : Realtek PCIe GbE Family Controller\n   Physical Address. . . . . . . . . : C8-5A-CF-3F-F7-FD\n   DHCP Enabled. . . . . . . . . . . : Yes\n   Autoconfiguration Enabled . . . . : Yes\n\nEthernet adapter Ethernet 2:\n\n   Media State . . . . . . . . . . . : Media disconnected\n   Connection-specific DNS Suffix  . : \n   Description . . . . . . . . . . . : ExpressVPN TAP Adapter\n   Physical Address. . . . . . . . . : 00-FF-C7-0E-A5-86\n   DHCP Enabled. . . . . . . . . . . : Yes\n   Autoconfiguration Enabled . . . . : Yes\n\nUnknown adapter Local Area Connection:\n\n   Media State . . . . . . . . . . . : Media disconnected\n   Connection-specific DNS Suffix  . : \n   Description . . . . . . . . . . . : ExpressVPN Wintun Driver\n   Physical Address. . . . . . . . . : \n   DHCP Enabled. . . . . . . . . . . : No\n   Autoconfiguration Enabled . . . . : Yes\n\nWireless LAN adapter Local Area Connection* 3:\n\n   Media State . . . . . . . . . . . : Media disconnected\n   Connection-specific DNS Suffix  . : \n   Description . . . . . . . . . . . : Microsoft Wi-Fi Direct Virtual Adapter #3\n   Physical Address. . . . . . . . . : B6-B5-B6-AA-8C-99\n   DHCP Enabled. . . . . . . . . . . : Yes\n   Autoconfiguration Enabled . . . . : Yes\n\nWireless LAN adapter Local Area Connection* 4:\n\n   Media State . . . . . . . . . . . : Media disconnected\n   Connection-specific DNS Suffix  . : \n   Description . . . . . . . . . . . : Microsoft Wi-Fi Direct Virtual Adapter #4\n   Physical Address. . . . . . . . . : F6-B5-B6-AA-8C-99\n   DHCP Enabled. . . . . . . . . . . : Yes\n   Autoconfiguration Enabled . . . . : Yes\n\nWireless LAN adapter Wi-Fi:\n\n   Media State . . . . . . . . . . . : Media disconnected\n   Connection-specific DNS Suffix  . : \n   Description . . . . . . . . . . . : Realtek RTL8822CE 802.11ac PCIe Adapter\n   Physical Address. . . . . . . . . : B4-B5-B6-AA-8C-99\n   DHCP Enabled. . . . . . . . . . . : Yes\n   Autoconfiguration Enabled . . . . : Yes\n\nEthernet adapter Bluetooth Network Connection 2:\n\n   Media State . . . . . . . . . . . : Media disconnected\n   Connection-specific DNS Suffix  . : \n   Description . . . . . . . . . . . : Bluetooth Device (Personal Area Network) #2\n   Physical Address. . . . . . . . . : B4-B5-B6-AA-8C-9A\n   DHCP Enabled. . . . . . . . . . . : Yes\n   Autoconfiguration Enabled . . . . : Yes"
+    }
+  ],
+  "status": "Open"
+}

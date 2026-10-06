@@ -3,3 +3,4 @@ LocalLLMs/
 ClassifierModels/
 __pycache__/
 *.pyc
+.env
