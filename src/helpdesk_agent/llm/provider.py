@@ -67,7 +67,7 @@ class ModelProvider:
         if self._cloud is None:
             self._cloud = OpenAI(api_key=CLOUD_API_KEY, base_url=CLOUD_API_ENDPOINT, timeout=90.0, max_retries=1)
 
-        response = self._cloud.chat.completions.create(
+        request = dict(
             model=CLOUD_MODEL,
             messages=[
                 {"role": "system", "content": system_prompt},
@@ -78,6 +78,14 @@ class ModelProvider:
             max_tokens=MODEL_MAX_TOKENS,
             stream=False,
         )
+        if json_mode:
+            # NVIDIA documents response_format=json_object for Nemotron 3 Ultra
+            # on its OpenAI-compatible Chat Completions API. This keeps the
+            # troubleshooting controller from receiving prose/reasoning instead
+            # of the JSON decision object.
+            request["response_format"] = {"type": "json_object"}
+
+        response = self._cloud.chat.completions.create(**request)
         content = response.choices[0].message.content or ""
         return ModelResult(content=content, backend="cloud")
 

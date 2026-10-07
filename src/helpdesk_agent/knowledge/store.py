@@ -2,28 +2,48 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from ..config import CATEGORY_FILES, KB_ROOT
+from ..config import KB_ROOT
 
 
-def find_kb(category: str) -> Path:
-    filename = CATEGORY_FILES[category]
-    exact = KB_ROOT / filename
-    if exact.exists():
-        return exact
+def discover_kbs() -> dict[str, Path]:
+    """Discover all Markdown KBs at runtime.
 
-    # A little tolerance for the filenames the project has used during development.
-    aliases = {
-        "Windows Update Stuck / Failing": ["windows_update.md", "windows_update_stuck.md", "windows_update_stuck_failing.md"],
-        "Application Not Responding / Frozen App": ["application_not_responding.md", "application_frozen.md"],
-        "Time / Date Synchronization Problem": ["time_date_synchronization.md", "time_synchronization.md", "time_date.md"],
-        "Internet": ["internet_connectivity.md", "internet.md"],
+    The filename itself is the classifier's category identifier. There is no
+    hardcoded category-to-file mapping.
+    """
+    if not KB_ROOT.exists():
+        return {}
+    return {
+        path.name: path
+        for path in sorted(KB_ROOT.glob("*.md"), key=lambda p: p.name.lower())
+        if path.is_file()
     }
-    for name in aliases.get(category, []):
-        p = KB_ROOT / name
-        if p.exists():
-            return p
-    raise FileNotFoundError(f"Knowledge base not found for '{category}' in {KB_ROOT}")
 
 
-def load_kb(category: str) -> str:
-    return find_kb(category).read_text(encoding="utf-8")
+def load_kb(filename: str) -> str:
+    """Load one discovered KB by its exact runtime filename."""
+    kbs = discover_kbs()
+    path = kbs.get(filename)
+    if path is None:
+        raise FileNotFoundError(f"Knowledge base '{filename}' was not found in {KB_ROOT}")
+    return path.read_text(encoding="utf-8")
+
+
+def build_kb_catalog(preview_chars: int = 1800) -> str:
+    """Build a compact dynamic catalog for classification.
+
+    The model gets the exact filenames plus a preview from each KB, without
+    requiring Python to encode any semantic classification rules.
+    """
+    kbs = discover_kbs()
+    if not kbs:
+        return "No Markdown knowledge-base files were found."
+
+    sections: list[str] = []
+    for filename, path in kbs.items():
+        text = path.read_text(encoding="utf-8", errors="replace").strip()
+        preview = text[:preview_chars]
+        if len(text) > preview_chars:
+            preview += "\n[preview truncated]"
+        sections.append(f"### {filename}\n{preview}")
+    return "\n\n".join(sections)

@@ -23,15 +23,28 @@ class ToolDefinition:
     description: str
     requires_approval: bool
     runner: Callable[[dict], ToolResult]
+    argument_hints: str = ""
 
 
 def _run_ps(script: str, timeout: int = 30) -> ToolResult:
     if os.name != "nt":
-        return ToolResult(False, "This diagnostic is only supported on Windows.")
+        return ToolResult(False, "This tool is only supported on Windows.")
     try:
         p = subprocess.run(
-            ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script],
-            capture_output=True, text=True, timeout=timeout, encoding="utf-8", errors="replace",
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                script,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            encoding="utf-8",
+            errors="replace",
         )
         out = (p.stdout or "").strip()
         err = (p.stderr or "").strip()
@@ -44,9 +57,16 @@ def _run_ps(script: str, timeout: int = 30) -> ToolResult:
 
 def _run_cmd(args: list[str], timeout: int = 30) -> ToolResult:
     if os.name != "nt":
-        return ToolResult(False, "This diagnostic is only supported on Windows.")
+        return ToolResult(False, "This tool is only supported on Windows.")
     try:
-        p = subprocess.run(args, capture_output=True, text=True, timeout=timeout, encoding="utf-8", errors="replace")
+        p = subprocess.run(
+            args,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            encoding="utf-8",
+            errors="replace",
+        )
         out = ((p.stdout or "") + ("\n" + p.stderr if p.stderr else "")).strip()
         return ToolResult(p.returncode == 0, out or f"Process exited with code {p.returncode}.")
     except Exception as exc:
@@ -73,19 +93,21 @@ Test-Connection -ComputerName $gw -Count 2 -Quiet | ForEach-Object { "Gateway re
 
 
 def check_internet_ip(_: dict) -> ToolResult:
-    # ICMP is useful as one signal; also perform a small HTTPS check so a blocked ICMP echo
-    # does not automatically mean that the Internet is unavailable.
     results = []
     try:
-        ip_ok = any(x for x in socket.getaddrinfo("example.com", 443))
+        ip_ok = bool(socket.getaddrinfo("example.com", 443))
         results.append(f"DNS socket resolution available: {ip_ok}")
     except Exception as exc:
         results.append(f"DNS socket resolution failed: {exc}")
     try:
-        req = urllib.request.Request("https://example.com/", method="HEAD", headers={"User-Agent": "IT-Helpdesk-L1-Agent/1.0"})
-        with urllib.request.urlopen(req, timeout=8) as r:
-            results.append(f"HTTPS Internet check: HTTP {r.status}")
-            https_ok = 200 <= r.status < 500
+        req = urllib.request.Request(
+            "https://example.com/",
+            method="HEAD",
+            headers={"User-Agent": "IT-Helpdesk-L1-Agent/1.0"},
+        )
+        with urllib.request.urlopen(req, timeout=8) as response:
+            results.append(f"HTTPS Internet check: HTTP {response.status}")
+            https_ok = 200 <= response.status < 500
     except Exception as exc:
         results.append(f"HTTPS Internet check failed: {exc}")
         https_ok = False
@@ -136,7 +158,7 @@ def close_unresponsive_app(args: dict) -> ToolResult:
     pid = str(args.get("pid", "")).strip()
     name = str(args.get("process_name", "")).strip()
     if not pid and not name:
-        return ToolResult(False, "No verified target process was supplied.")
+        return ToolResult(False, "No target process was supplied in the tool arguments.")
     if pid and not pid.isdigit():
         return ToolResult(False, "Invalid process ID.")
     if pid:
@@ -229,32 +251,131 @@ def fix_restart_time_service(_: dict) -> ToolResult:
     return _run_ps("Restart-Service W32Time -Force -ErrorAction Stop; Start-Service W32Time -ErrorAction Stop; Get-Service W32Time | Select-Object Name,Status | Format-Table -AutoSize | Out-String", 30)
 
 
+def _usb_instance_id(arguments: dict, allow_prefixes: tuple[str, ...]) -> str | None:
+    value = str(arguments.get("instance_id", "")).strip().strip('"')
+    upper = value.upper()
+    if not value or not any(upper.startswith(prefix) for prefix in allow_prefixes):
+        return None
+    return value
+
+
+def check_usb_devices(_: dict) -> ToolResult:
+    # Win32_PnPEntity exposes the Windows PnP state and ConfigManagerErrorCode.
+    script = r'''
+$devices = Get-CimInstance Win32_PnPEntity -ErrorAction Stop |
+    Where-Object { $_.PNPDeviceID -like 'USB\*' } |
+    Select-Object Name,PNPClass,PNPDeviceID,Status,ConfigManagerErrorCode
+if (-not $devices) {
+    Write-Output "No currently enumerated USB PnP devices were found."
+    exit 0
+}
+$devices | Format-List | Out-String
+'''
+    return _run_ps(script)
+
+
+def scan_usb_devices(_: dict) -> ToolResult:
+    return _run_cmd(["pnputil", "/scan-devices"], 45)
+
+
+def check_usb_controllers(_: dict) -> ToolResult:
+    script = r'''
+$controllers = Get-CimInstance Win32_PnPEntity -ErrorAction Stop |
+    Where-Object {
+        $_.PNPClass -eq 'USB' -and
+        ($_.Name -match 'Host Controller|Root Hub|USB xHCI|USB eXtensible')
+    } |
+    Select-Object Name,PNPClass,PNPDeviceID,Status,ConfigManagerErrorCode
+if (-not $controllers) {
+    Write-Output "No USB host controller or root hub entries were found by this query."
+    exit 0
+}
+$controllers | Format-List | Out-String
+'''
+    return _run_ps(script)
+
+
+def enable_usb_device(arguments: dict) -> ToolResult:
+    instance_id = _usb_instance_id(arguments, ("USB\\",))
+    if instance_id is None:
+        return ToolResult(False, "A valid USB instance_id from diagnostic evidence is required.")
+    return _run_cmd(["pnputil", "/enable-device", instance_id], 45)
+
+
+def restart_usb_device(arguments: dict) -> ToolResult:
+    instance_id = _usb_instance_id(arguments, ("USB\\",))
+    if instance_id is None:
+        return ToolResult(False, "A valid USB instance_id from diagnostic evidence is required.")
+    return _run_cmd(["pnputil", "/restart-device", instance_id], 45)
+
+
+def restart_usb_controller(arguments: dict) -> ToolResult:
+    instance_id = _usb_instance_id(arguments, ("USB\\", "PCI\\"))
+    if instance_id is None:
+        return ToolResult(False, "A valid USB/PCI controller instance_id from diagnostic evidence is required.")
+    return _run_cmd(["pnputil", "/restart-device", instance_id], 45)
+
+
 TOOLS: dict[str, ToolDefinition] = {
-    # Internet
     "check_adapter_state": ToolDefinition("check_adapter_state", "DIAGNOSTIC", "Inspect Windows network adapters.", False, check_adapter_state),
     "check_ip_config": ToolDefinition("check_ip_config", "DIAGNOSTIC", "Inspect IP, gateway and DNS configuration.", False, check_ip_config),
     "check_gateway": ToolDefinition("check_gateway", "DIAGNOSTIC", "Test reachability of the configured default gateway.", False, check_gateway),
     "check_internet_ip": ToolDefinition("check_internet_ip", "DIAGNOSTIC", "Test end-to-end Internet reachability.", False, check_internet_ip),
     "check_dns": ToolDefinition("check_dns", "DIAGNOSTIC", "Test DNS resolution.", False, check_dns),
     "enable_adapter": ToolDefinition("enable_adapter", "FIX", "Enable a verified disabled network adapter.", True, enable_adapter),
-    "fix_renew_dhcp": ToolDefinition("fix_renew_dhcp", "FIX", "Renew DHCP configuration when evidence supports it.", True, fix_renew_dhcp),
+    "fix_renew_dhcp": ToolDefinition("fix_renew_dhcp", "FIX", "Renew DHCP configuration when the KB evidence supports it.", True, fix_renew_dhcp),
     "fix_flush_dns": ToolDefinition("fix_flush_dns", "FIX", "Flush the Windows DNS resolver cache.", True, fix_flush_dns),
-    "fix_reset_winsock": ToolDefinition("fix_reset_winsock", "FIX", "Reset Winsock when the KB explicitly permits it.", True, fix_reset_winsock),
-    "fix_reset_tcpip": ToolDefinition("fix_reset_tcpip", "FIX", "Reset TCP/IP when the KB explicitly permits it.", True, fix_reset_tcpip),
-    # Application not responding
+    "fix_reset_winsock": ToolDefinition("fix_reset_winsock", "FIX", "Reset Winsock when permitted by the selected KB.", True, fix_reset_winsock),
+    "fix_reset_tcpip": ToolDefinition("fix_reset_tcpip", "FIX", "Reset TCP/IP when permitted by the selected KB.", True, fix_reset_tcpip),
+
     "check_not_responding_apps": ToolDefinition("check_not_responding_apps", "DIAGNOSTIC", "Find visible Windows applications reported as Not Responding.", False, check_not_responding_apps),
-    "close_unresponsive_app": ToolDefinition("close_unresponsive_app", "FIX", "Close a verified unresponsive application.", True, close_unresponsive_app),
-    # Windows Update
+    "close_unresponsive_app": ToolDefinition(
+        "close_unresponsive_app",
+        "FIX",
+        "Close the verified unresponsive application identified by diagnostic evidence.",
+        True,
+        close_unresponsive_app,
+        "{\"pid\": \"PID from check_not_responding_apps\", \"process_name\": \"optional process name\"}",
+    ),
+
     "check_windows_update_status": ToolDefinition("check_windows_update_status", "DIAGNOSTIC", "Inspect Windows Update service and update state.", False, check_windows_update_status),
     "check_windows_update_services": ToolDefinition("check_windows_update_services", "DIAGNOSTIC", "Inspect required Windows Update services.", False, check_windows_update_services),
     "check_pending_reboot": ToolDefinition("check_pending_reboot", "DIAGNOSTIC", "Check whether Windows is waiting for a reboot.", False, check_pending_reboot),
     "check_windows_update_error": ToolDefinition("check_windows_update_error", "DIAGNOSTIC", "Inspect recent Windows UpdateClient errors.", False, check_windows_update_error),
     "fix_restart_update_services": ToolDefinition("fix_restart_update_services", "FIX", "Restart relevant Windows Update services.", True, fix_restart_update_services),
     "fix_reset_windows_update_components": ToolDefinition("fix_reset_windows_update_components", "FIX", "Reset Windows Update component directories and restart services.", True, fix_reset_windows_update_components),
-    # Time/date
+
     "check_time_status": ToolDefinition("check_time_status", "DIAGNOSTIC", "Inspect current Windows time, timezone and sync state.", False, check_time_status),
     "check_time_service": ToolDefinition("check_time_service", "DIAGNOSTIC", "Inspect Windows Time service state.", False, check_time_service),
     "check_time_source": ToolDefinition("check_time_source", "DIAGNOSTIC", "Inspect the configured Windows time source.", False, check_time_source),
     "fix_sync_time": ToolDefinition("fix_sync_time", "FIX", "Request Windows time synchronization.", True, fix_sync_time),
     "fix_restart_time_service": ToolDefinition("fix_restart_time_service", "FIX", "Restart the Windows Time service.", True, fix_restart_time_service),
+
+    "check_usb_devices": ToolDefinition("check_usb_devices", "DIAGNOSTIC", "Inspect currently enumerated USB Plug and Play devices and problem codes.", False, check_usb_devices),
+    "scan_usb_devices": ToolDefinition("scan_usb_devices", "DIAGNOSTIC", "Ask Windows Plug and Play to rescan for hardware changes.", False, scan_usb_devices),
+    "check_usb_controllers": ToolDefinition("check_usb_controllers", "DIAGNOSTIC", "Inspect USB host controller and root hub entries and problem codes.", False, check_usb_controllers),
+    "enable_usb_device": ToolDefinition(
+        "enable_usb_device",
+        "FIX",
+        "Enable a verified disabled USB device.",
+        True,
+        enable_usb_device,
+        "{\"instance_id\": \"exact USB instance ID from the latest diagnostic\"}",
+    ),
+    "restart_usb_device": ToolDefinition(
+        "restart_usb_device",
+        "FIX",
+        "Restart a verified USB device using its exact instance ID.",
+        True,
+        restart_usb_device,
+        "{\"instance_id\": \"exact USB instance ID from the latest diagnostic\"}",
+    ),
+    "restart_usb_controller": ToolDefinition(
+        "restart_usb_controller",
+        "FIX",
+        "Restart a verified USB host controller/root hub using its exact instance ID.",
+        True,
+        restart_usb_controller,
+        "{\"instance_id\": \"exact USB or PCI controller instance ID from the latest diagnostic\"}",
+    ),
 }
