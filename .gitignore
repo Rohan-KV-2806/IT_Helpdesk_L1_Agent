@@ -4,3 +4,6 @@ ClassifierModels/
 __pycache__/
 *.pyc
 .env
+tickets/
+reports/
+BestVEr/

@@ -31,9 +31,11 @@ pip install -U "huggingface_hub[cli]"
 
 5. Download the model
 ```
-hf download bartowski/SmolLM2-135M-Instruct-GGUF --include "Your model name" --local-dir LocalLLMs
+hf download bartowski/Qwen_Qwen3-0.6B-GGUF ^
+  --include "Qwen3-0.6B-Q4_K_M.gguf" ^
+  --local-dir LocalLLMs
 ```
-replace with your model of choice along with its extension for example "LocalLLMs/Qwen_Qwen3-0.6B-Q4_K_M.gguf"
+replace with your model of choice along with its extension for 
 
 6. Check folder
 ```

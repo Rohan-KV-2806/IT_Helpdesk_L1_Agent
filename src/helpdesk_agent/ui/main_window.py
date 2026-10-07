@@ -1,50 +1,26 @@
 from __future__ import annotations
 
+import html
 import threading
 
-from PySide6.QtCore import QObject, QThread, Qt, Signal, Slot
+from PySide6.QtCore import QThread, Qt, Signal, Slot
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QApplication,
+    QComboBox,
     QFrame,
-    QGridLayout,
     QHBoxLayout,
     QLabel,
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
-    QScrollArea,
-    QSizePolicy,
-    QSplitter,
     QTextBrowser,
     QVBoxLayout,
     QWidget,
 )
 
 from ..agent.service import AgentEvent, AgentService
-from ..config import INTENTS
-
-SAMPLES = {
-    "INTERNET_CONNECTIVITY": "There is something wrong with my internet.",
-    "DNS_PROBLEM": "Websites are not resolving, but I can reach the network.",
-    "IP_CONFIGURATION": "My computer got a strange IP and I cannot connect.",
-    "WINDOWS_UPDATE": "Windows Update keeps failing.",
-    "VPN_PROBLEM": "My VPN is not connecting.",
-    "OTHER_UNKNOWN": "I have an IT problem that I cannot identify.",
-    "PRINTER_PROBLEM": "The office printer is offline.",
-    "FILE_FOLDER_PERMISSION": "I get access denied when opening a shared folder.",
-    "NETWORK_ADAPTER": "My network adapter appears to be disabled.",
-    "APPLICATION_NOT_RESPONDING": "An application is frozen and says not responding.",
-    "REMOTE_DESKTOP": "I cannot connect to my office PC with Remote Desktop.",
-    "WIFI_PROBLEM": "My Wi-Fi keeps disconnecting.",
-    "HIGH_MEMORY_USAGE": "My computer is running out of RAM.",
-    "WINDOWS_SERVICE": "A Windows service is not running.",
-    "SYSTEM_INFORMATION": "I need to check my Windows and system information.",
-    "HIGH_CPU_USAGE": "My CPU is stuck near 100 percent.",
-    "DISK_SPACE": "My C drive is almost full.",
-    "OUTLOOK_PROBLEM": "Outlook is not working correctly.",
-}
 
 
 class ApprovalBridge:
@@ -62,26 +38,18 @@ class AgentWorker(QThread):
     approval_signal = Signal(object, str, str)
     finished_signal = Signal()
 
-    def __init__(self, service: AgentService, problem: str, forced_intent: str | None) -> None:
+    def __init__(self, service: AgentService, problem: str, backend: str) -> None:
         super().__init__()
         self.service = service
         self.problem = problem
-        self.forced_intent = forced_intent
+        self.backend = backend
         self._approval: ApprovalBridge | None = None
 
     def run(self) -> None:
         try:
-            self.service.run(
-                self.problem,
-                self.forced_intent,
-                self._emit_event,
-                self._request_approval,
-            )
+            self.service.run(self.problem, self.backend, self.event_signal.emit, self._request_approval)
         finally:
             self.finished_signal.emit()
-
-    def _emit_event(self, event: AgentEvent) -> None:
-        self.event_signal.emit(event)
 
     def _request_approval(self, action: str, message: str, reason: str) -> bool:
         bridge = ApprovalBridge()
@@ -99,147 +67,112 @@ class AgentWorker(QThread):
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("IT Helpdesk • L1 Agent")
-        self.setMinimumSize(920, 610)
-        self.resize(980, 650)
-
+        self.setWindowTitle("L1 Agent")
+        self.setFixedSize(620, 430)
         self.service = AgentService()
         self.worker: AgentWorker | None = None
-        self.active_intent: str | None = None
-
         self._build_ui()
-        self._apply_style()
+        self._style()
 
     def _build_ui(self) -> None:
         root = QWidget()
-        root_layout = QVBoxLayout(root)
-        root_layout.setContentsMargins(16, 14, 16, 14)
-        root_layout.setSpacing(10)
+        layout = QVBoxLayout(root)
+        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setSpacing(9)
 
-        # Header
-        header = QFrame()
-        header_layout = QHBoxLayout(header)
-        header_layout.setContentsMargins(0, 0, 0, 2)
-        title_box = QVBoxLayout()
-        title = QLabel("IT Helpdesk")
+        title_row = QHBoxLayout()
+        title = QLabel("L1 Agent")
         title.setObjectName("title")
-        subtitle = QLabel("L1 AI Agent  •  Local-first diagnostics  •  Cloud → Local fallback")
-        subtitle.setObjectName("subtitle")
-        title_box.addWidget(title)
-        title_box.addWidget(subtitle)
-        header_layout.addLayout(title_box)
-        header_layout.addStretch()
-        self.status = QLabel("READY")
-        self.status.setObjectName("status")
-        header_layout.addWidget(self.status, alignment=Qt.AlignmentFlag.AlignTop)
-        root_layout.addWidget(header)
+        title_row.addWidget(title)
+        title_row.addStretch()
+        close_btn = QPushButton("×")
+        close_btn.setObjectName("closeButton")
+        close_btn.setFixedSize(38, 34)
+        close_btn.clicked.connect(self.close)
+        title_row.addWidget(close_btn)
+        layout.addLayout(title_row)
 
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.setChildrenCollapsible(False)
+        controls = QHBoxLayout()
+        self.problem_label = QLabel("Problem: waiting for request")
+        self.problem_label.setObjectName("problem")
+        controls.addWidget(self.problem_label, 1)
 
-        # Debug panel
-        debug_panel = QFrame()
-        debug_layout = QVBoxLayout(debug_panel)
-        debug_layout.setContentsMargins(0, 0, 8, 0)
-        debug_title = QLabel("Debug intents")
-        debug_title.setObjectName("sectionTitle")
-        debug_hint = QLabel("Click an intent to load a test case.")
-        debug_hint.setWordWrap(True)
-        debug_hint.setObjectName("hint")
-        debug_layout.addWidget(debug_title)
-        debug_layout.addWidget(debug_hint)
-
-        self.active_label = QLabel("Active: AUTO")
-        self.active_label.setObjectName("active")
-        debug_layout.addWidget(self.active_label)
-
-        clear_btn = QPushButton("Auto intent")
-        clear_btn.clicked.connect(self.clear_intent)
-        debug_layout.addWidget(clear_btn)
-
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.Shape.NoFrame)
-        buttons_host = QWidget()
-        grid = QGridLayout(buttons_host)
-        grid.setContentsMargins(0, 6, 0, 0)
-        grid.setSpacing(6)
-        for idx, intent in enumerate(INTENTS):
-            button = QPushButton(intent.replace("_", " "))
-            button.setToolTip(SAMPLES.get(intent, ""))
-            button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-            button.clicked.connect(lambda checked=False, x=intent: self.select_intent(x))
-            grid.addWidget(button, idx // 2, idx % 2)
-        scroll.setWidget(buttons_host)
-        debug_layout.addWidget(scroll, stretch=1)
-
-        # Chat panel
-        chat_panel = QFrame()
-        chat_layout = QVBoxLayout(chat_panel)
-        chat_layout.setContentsMargins(8, 0, 0, 0)
+        self.backend = QComboBox()
+        self.backend.addItems(["cloud", "local"])
+        self.backend.setCurrentText("cloud")
+        self.backend.setFixedWidth(86)
+        controls.addWidget(self.backend)
+        layout.addLayout(controls)
 
         self.chat = QTextBrowser()
         self.chat.setOpenExternalLinks(False)
-        self.chat.setPlaceholderText("Agent activity will appear here…")
-        chat_layout.addWidget(self.chat, stretch=1)
+        self.chat.setObjectName("chat")
+        layout.addWidget(self.chat, 1)
 
-        self.cwd_label = QLabel("Command working directory: the directory from which the app is launched")
-        self.cwd_label.setObjectName("hint")
-        chat_layout.addWidget(self.cwd_label)
-
-        composer = QFrame()
-        composer_layout = QHBoxLayout(composer)
-        composer_layout.setContentsMargins(0, 6, 0, 0)
+        composer = QHBoxLayout()
         self.input = QPlainTextEdit()
-        self.input.setPlaceholderText("Describe the IT problem…")
-        self.input.setFixedHeight(74)
-        composer_layout.addWidget(self.input, stretch=1)
-        send = QPushButton("Run Agent")
-        send.setObjectName("send")
-        send.setFixedWidth(110)
-        send.clicked.connect(self.start_agent)
-        composer_layout.addWidget(send, alignment=Qt.AlignmentFlag.AlignBottom)
-        chat_layout.addWidget(composer)
-
-        splitter.addWidget(debug_panel)
-        splitter.addWidget(chat_panel)
-        splitter.setSizes([250, 700])
-        root_layout.addWidget(splitter, stretch=1)
+        self.input.setPlaceholderText("Type here")
+        self.input.setFixedHeight(43)
+        self.input.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        composer.addWidget(self.input, 1)
+        self.send = QPushButton("send")
+        self.send.setFixedSize(80, 43)
+        self.send.clicked.connect(self.start_agent)
+        composer.addWidget(self.send)
+        layout.addLayout(composer)
 
         self.setCentralWidget(root)
 
-    def _apply_style(self) -> None:
+    def _style(self) -> None:
         self.setStyleSheet("""
-            QWidget { background: #0f1115; color: #e7e9ee; font-family: Segoe UI; font-size: 10pt; }
-            QFrame { background: #0f1115; }
-            #title { font-size: 21px; font-weight: 700; color: #ffffff; }
-            #subtitle { color: #9da4b0; margin-top: 1px; }
-            #sectionTitle { font-size: 12px; font-weight: 700; color: #ffffff; }
-            #hint { color: #858d9b; font-size: 9pt; }
-            #active, #status { color: #b9c6ff; font-weight: 600; }
-            #status { background: #1b2438; border-radius: 8px; padding: 6px 9px; }
-            QTextBrowser { background: #151820; border: 1px solid #242a35; border-radius: 10px; padding: 12px; }
-            QPlainTextEdit { background: #151820; border: 1px solid #2a303b; border-radius: 9px; padding: 8px; }
-            QPushButton { background: #1a1f28; border: 1px solid #303743; border-radius: 7px; padding: 7px 8px; color: #e7e9ee; }
-            QPushButton:hover { background: #222936; }
-            QPushButton:pressed { background: #2a3140; }
-            #send { background: #3d63d8; border: none; font-weight: 700; }
-            #send:hover { background: #5074e4; }
-            QScrollArea { background: transparent; }
+        QWidget {
+            background: #fbfaf8;
+            color: #262626;
+            font-family: "Segoe UI";
+            font-size: 12px;
+        }
+        #title {
+            background: #ffffff;
+            border: 1px solid #1f1f1f;
+            padding: 5px 9px;
+            font-size: 16px;
+            font-weight: 650;
+        }
+        #closeButton, #send {
+            background: #ffffff;
+            border: 1px solid #1f1f1f;
+            color: #1f1f1f;
+            font-size: 14px;
+        }
+        #closeButton:hover, #send:hover { background: #f0efec; }
+        #problem {
+            background: #ffffff;
+            border: 1px solid #555555;
+            padding: 6px 10px;
+            font-size: 13px;
+        }
+        QComboBox {
+            background: #ffffff;
+            border: 1px solid #555555;
+            padding: 6px 8px;
+        }
+        QComboBox::drop-down { border: none; width: 22px; }
+        #chat {
+            background: #ffffff;
+            border: 1px solid #555555;
+            padding: 8px;
+        }
+        QPlainTextEdit {
+            background: #ffffff;
+            border: 1px solid #555555;
+            padding: 8px 10px;
+        }
         """)
 
-    def clear_intent(self) -> None:
-        self.active_intent = None
-        self.active_label.setText("Active: AUTO")
-
-    def select_intent(self, intent: str) -> None:
-        self.active_intent = intent
-        self.active_label.setText(f"Active: {intent}")
-        self.input.setPlainText(SAMPLES.get(intent, ""))
-        self.input.setFocus()
-
-    def append(self, title: str, text: str) -> None:
-        self.chat.append(f"<b>{title}</b><br>{_escape(text)}<br>")
+    def _append(self, who: str, message: str) -> None:
+        safe = html.escape(message).replace("\n", "<br>")
+        self.chat.append(f"<b>{html.escape(who)}</b><br>{safe}<br>")
+        self.chat.verticalScrollBar().setValue(self.chat.verticalScrollBar().maximum())
 
     @Slot()
     def start_agent(self) -> None:
@@ -249,40 +182,50 @@ class MainWindow(QMainWindow):
         if not problem:
             return
 
-        self.append("You", problem)
-        self.append("Agent", "Starting diagnosis…")
-        self.status.setText("RUNNING")
+        self.problem_label.setText(f"Problem: {problem[:55]}" + ("…" if len(problem) > 55 else ""))
+        self._append("You", problem)
+        self._append("Agent", "Working…")
+        self.send.setEnabled(False)
+        self.backend.setEnabled(False)
 
-        self.worker = AgentWorker(self.service, problem, self.active_intent)
+        self.worker = AgentWorker(self.service, problem, self.backend.currentText())
         self.worker.event_signal.connect(self.on_event)
         self.worker.approval_signal.connect(self.on_approval)
         self.worker.finished_signal.connect(self.on_finished)
         self.worker.start()
+        self.input.clear()
 
     @Slot(object)
     def on_event(self, event: AgentEvent) -> None:
         labels = {
-            "intent": "Intent",
+            "classification": "Agent",
             "status": "Agent",
-            "model": "Model",
+            "model": "Agent",
             "tool": "Tool",
-            "tool_result": "Diagnostic Result",
-            "resolved": "Resolved",
-            "ask": "Need Information",
+            "tool_result": "Result",
+            "resolved": "Agent",
             "ticket": "Ticket",
-            "error": "Error",
+            "unsupported": "Agent",
+            "ask": "Agent",
+            "internal_error": "Error",
         }
-        self.append(labels.get(event.kind, "Agent"), event.message)
-        if event.kind == "ticket":
-            self.status.setText("TICKET")
-        elif event.kind == "resolved":
-            self.status.setText("RESOLVED")
+        label = labels.get(event.kind, "Agent")
+        self._append(label, event.message)
+
+        if event.kind == "resolved" and event.payload and event.payload.get("report"):
+            self._append("JSON report", __import__("json").dumps(event.payload["report"], indent=2))
+        elif event.kind == "ticket" and event.payload:
+            self._append("Ticket", f"Saved: {event.payload.get('path', '')}")
+        elif event.kind == "unsupported" and event.payload:
+            self._append("Ticket", f"Saved: {event.payload.get('path', '')}")
+        elif event.kind == "internal_error":
+            QMessageBox.warning(self, "Agent error", event.message)
 
     @Slot(object, str, str)
     def on_approval(self, action: str, message: str, reason: str) -> None:
         answer = QMessageBox.question(
             self,
-            "Approve system change",
+            "Approve L1 fix",
             f"Action: {action}\n\n{message}\n\nReason: {reason}\n\nAllow this action to run?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
@@ -290,15 +233,9 @@ class MainWindow(QMainWindow):
         if self.worker:
             self.worker.respond_to_approval(answer == QMessageBox.StandardButton.Yes)
 
+    @Slot()
     def on_finished(self) -> None:
-        self.status.setText("READY" if self.status.text() == "RUNNING" else self.status.text())
+        self.send.setEnabled(True)
+        self.backend.setEnabled(True)
         self.worker = None
-
-
-def _escape(value: str) -> str:
-    return (
-        value.replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-        .replace("\n", "<br>")
-    )
+        self.input.setFocus()

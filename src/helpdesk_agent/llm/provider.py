@@ -1,116 +1,119 @@
 from __future__ import annotations
 
 import json
-import re
 from dataclasses import dataclass
 from typing import Any
-
-from openai import OpenAI
-from llama_cpp import Llama
 
 from ..config import (
     CLOUD_API_ENDPOINT,
     CLOUD_API_KEY,
     CLOUD_MODEL,
+    LOCAL_CHAT_TEMPLATE_THINKING,
     LOCAL_MODEL,
+    LOCAL_N_GPU_LAYERS,
     MODEL_CONTEXT,
+    MODEL_MAX_TOKENS,
     MODEL_THREADS,
+    PROMPT_TEMPERATURE,
+    PROMPT_TOP_P,
 )
 
 
 @dataclass
 class ModelResult:
-    backend: str
     content: str
-
-
-class ModelProvider:
-    """Cloud-first provider with a lazy-loaded local fallback."""
-
-    def __init__(self) -> None:
-        self._cloud: OpenAI | None = None
-        self._local: Llama | None = None
-
-    def _cloud_client(self) -> OpenAI:
-        if self._cloud is None:
-            if not (CLOUD_API_ENDPOINT and CLOUD_API_KEY and CLOUD_MODEL):
-                raise RuntimeError("Cloud model configuration is incomplete")
-            self._cloud = OpenAI(
-                base_url=CLOUD_API_ENDPOINT,
-                api_key=CLOUD_API_KEY,
-                timeout=30.0,
-            )
-        return self._cloud
-
-    def _local_model(self) -> Llama:
-        if self._local is None:
-            if not LOCAL_MODEL:
-                raise RuntimeError("LOCAL_MODEL is not configured")
-            self._local = Llama(
-                model_path=LOCAL_MODEL,
-                n_ctx=MODEL_CONTEXT,
-                n_threads=MODEL_THREADS,
-                verbose=False,
-            )
-        return self._local
-
-    def complete(self, system_prompt: str, user_prompt: str) -> ModelResult:
-        """Call cloud first; fall back to local on any cloud failure."""
-        cloud_error: Exception | None = None
-
-        if CLOUD_API_ENDPOINT and CLOUD_API_KEY and CLOUD_MODEL:
-            try:
-                kwargs = {
-                    "model": CLOUD_MODEL,
-                    "messages": [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt},
-                    ],
-                    "temperature": 0.0,
-                    "max_tokens": 6000,
-                }
-                if "nemotron-3-ultra" in CLOUD_MODEL.lower():
-                    kwargs["reasoning_effort"] = "none"
-                response = self._cloud_client().chat.completions.create(**kwargs)
-                return ModelResult("Cloud", response.choices[0].message.content or "")
-            except Exception as exc:  # noqa: BLE001
-                cloud_error = exc
-
-        try:
-            model = self._local_model()
-            response = model.create_chat_completion(
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                temperature=0.0,
-                top_p=1.0,
-                max_tokens=6000,
-                # Safe for Qwen-style templates; ignored by templates that don't use it.
-                # chat_template_kwargs={"enable_thinking": False},
-            )
-            content = response["choices"][0]["message"].get("content", "")
-            return ModelResult("Local", _clean_thinking(content))
-        except Exception as local_error:
-            if cloud_error is not None:
-                raise RuntimeError(
-                    f"Cloud model failed ({cloud_error}); local model also failed ({local_error})"
-                ) from local_error
-            raise
-
-
-def _clean_thinking(text: str) -> str:
-    if "</think>" in text:
-        text = text.split("</think>", 1)[1]
-    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
-    return text.strip()
+    backend: str
 
 
 def parse_json_object(text: str) -> dict[str, Any]:
-    """Extract a JSON object from a model response."""
-    cleaned = _clean_thinking(text).strip()
-    cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", cleaned, flags=re.IGNORECASE)
-    match = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
-    if not match:
-        raise ValueError(f"Model did not return JSON: {cleaned[:300]}")
-    return json.loads(match.group(0))
+    text = (text or "").strip()
+    if text.startswith("```"):
+        text = text.replace("```json", "", 1).replace("```", "", 1).strip()
+    try:
+        value = json.loads(text)
+        if isinstance(value, dict):
+            return value
+    except json.JSONDecodeError:
+        pass
+
+    # Recover a JSON object when a model adds a small amount of text.
+    start = text.find("{")
+    end = text.rfind("}")
+    if start >= 0 and end > start:
+        value = json.loads(text[start : end + 1])
+        if isinstance(value, dict):
+            return value
+    raise ValueError(f"Model did not return valid JSON: {text[:500]}")
+
+
+class ModelProvider:
+    def __init__(self) -> None:
+        self._local = None
+        self._cloud = None
+
+    def complete(self, system_prompt: str, user_prompt: str, backend: str, json_mode: bool = True) -> ModelResult:
+        backend = backend.lower().strip()
+        if backend == "cloud":
+            return self._cloud_complete(system_prompt, user_prompt, json_mode)
+        if backend == "local":
+            return self._local_complete(system_prompt, user_prompt, json_mode)
+        raise ValueError(f"Unknown backend: {backend}")
+
+    def _cloud_complete(self, system_prompt: str, user_prompt: str, json_mode: bool) -> ModelResult:
+        if not CLOUD_API_KEY or not CLOUD_MODEL:
+            raise RuntimeError("Cloud model is not configured. Check CLOUD_API_KEY and CLOUD_MODEL in .env.")
+        from openai import OpenAI
+
+        if self._cloud is None:
+            self._cloud = OpenAI(api_key=CLOUD_API_KEY, base_url=CLOUD_API_ENDPOINT, timeout=90.0, max_retries=1)
+
+        response = self._cloud.chat.completions.create(
+            model=CLOUD_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=PROMPT_TEMPERATURE,
+            top_p=PROMPT_TOP_P,
+            max_tokens=MODEL_MAX_TOKENS,
+            stream=False,
+        )
+        content = response.choices[0].message.content or ""
+        return ModelResult(content=content, backend="cloud")
+
+    def _load_local(self):
+        if not LOCAL_MODEL:
+            raise RuntimeError("Local model is not configured. Check LOCAL_MODEL in .env.")
+        from llama_cpp import Llama
+
+        self._local = Llama(
+            model_path=LOCAL_MODEL,
+            n_ctx=MODEL_CONTEXT,
+            n_threads=MODEL_THREADS,
+            n_gpu_layers=LOCAL_N_GPU_LAYERS,
+            verbose=False,
+        )
+        return self._local
+
+    def _local_complete(self, system_prompt: str, user_prompt: str, json_mode: bool) -> ModelResult:
+        llm = self._local or self._load_local()
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+        kwargs = dict(
+            messages=messages,
+            temperature=PROMPT_TEMPERATURE,
+            top_p=PROMPT_TOP_P,
+            max_tokens=MODEL_MAX_TOKENS,
+            **({"response_format": {"type": "json_object"}} if json_mode else {}),
+        )
+        if not LOCAL_CHAT_TEMPLATE_THINKING:
+            kwargs["chat_template_kwargs"] = {"enable_thinking": False}
+        try:
+            response = llm.create_chat_completion(**kwargs)
+        except TypeError:
+            kwargs.pop("chat_template_kwargs", None)
+            response = llm.create_chat_completion(**kwargs)
+        content = response["choices"][0]["message"].get("content", "") or ""
+        return ModelResult(content=content, backend="local")
