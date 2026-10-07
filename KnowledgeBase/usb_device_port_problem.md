@@ -15,7 +15,7 @@ Use this knowledge base for Windows USB problems such as:
 - USB device disabled
 - USB device repeatedly disconnecting or failing to start
 - One or more USB ports not working
-- USB host controller / root hub problems that affect USB devices
+- USB host controller / root hub problems that affect USB devices.
 
 This knowledge base is for Windows L1 troubleshooting only.
 
