@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-import json
 import os
 import socket
 import subprocess
 import time
-import urllib.request
 from dataclasses import dataclass
 from typing import Callable
 
@@ -14,16 +12,6 @@ from typing import Callable
 class ToolResult:
     success: bool
     output: str
-
-
-@dataclass
-class ToolDefinition:
-    name: str
-    category: str  # DIAGNOSTIC or FIX
-    description: str
-    requires_approval: bool
-    runner: Callable[[dict], ToolResult]
-    argument_hints: str = ""
 
 
 def _run_ps(script: str, timeout: int = 30) -> ToolResult:
@@ -73,6 +61,10 @@ def _run_cmd(args: list[str], timeout: int = 30) -> ToolResult:
         return ToolResult(False, str(exc))
 
 
+# ---------------------------------------------------------------------------
+# Network
+# ---------------------------------------------------------------------------
+
 def check_adapter_state(_: dict) -> ToolResult:
     return _run_ps("Get-NetAdapter | Select-Object Name,Status,LinkSpeed,MacAddress | Format-Table -AutoSize | Out-String")
 
@@ -100,18 +92,27 @@ def check_internet_ip(_: dict) -> ToolResult:
     except Exception as exc:
         results.append(f"DNS socket resolution failed: {exc}")
     try:
-        req = urllib.request.Request(
-            "https://example.com/",
-            method="HEAD",
-            headers={"User-Agent": "IT-Helpdesk-L1-Agent/1.0"},
-        )
-        with urllib.request.urlopen(req, timeout=8) as response:
+        req = urllib_request("https://example.com/")
+        with req as response:
             results.append(f"HTTPS Internet check: HTTP {response.status}")
             https_ok = 200 <= response.status < 500
     except Exception as exc:
         results.append(f"HTTPS Internet check failed: {exc}")
         https_ok = False
     return ToolResult(https_ok, "\n".join(results))
+
+
+def urllib_request(url: str):
+    import urllib.request
+
+    return urllib.request.urlopen(
+        urllib.request.Request(
+            url,
+            method="HEAD",
+            headers={"User-Agent": "IT-Helpdesk-L1-Agent/1.0"},
+        ),
+        timeout=8,
+    )
 
 
 def check_dns(_: dict) -> ToolResult:
@@ -142,6 +143,10 @@ def fix_reset_tcpip(_: dict) -> ToolResult:
     return _run_cmd(["netsh", "int", "ip", "reset"], 30)
 
 
+# ---------------------------------------------------------------------------
+# Application responsiveness
+# ---------------------------------------------------------------------------
+
 def check_not_responding_apps(_: dict) -> ToolResult:
     script = r'''
 Get-Process | Where-Object { $_.MainWindowHandle -ne 0 -and $_.Responding -eq $false } |
@@ -168,6 +173,10 @@ def close_unresponsive_app(args: dict) -> ToolResult:
         script = f"Get-Process -Name '{safe_name}' -ErrorAction Stop | Stop-Process -Force -ErrorAction Stop; Write-Output 'Process {safe_name} terminated.'"
     return _run_ps(script, 30)
 
+
+# ---------------------------------------------------------------------------
+# Windows Update
+# ---------------------------------------------------------------------------
 
 def check_windows_update_status(_: dict) -> ToolResult:
     script = r'''
@@ -223,6 +232,10 @@ Write-Output "Windows Update component directories were renamed and services res
     return _run_ps(script, 90)
 
 
+# ---------------------------------------------------------------------------
+# Time / date
+# ---------------------------------------------------------------------------
+
 def check_time_status(_: dict) -> ToolResult:
     script = r'''
 Get-Date | ForEach-Object { "Local time: $_" }
@@ -251,6 +264,10 @@ def fix_restart_time_service(_: dict) -> ToolResult:
     return _run_ps("Restart-Service W32Time -Force -ErrorAction Stop; Start-Service W32Time -ErrorAction Stop; Get-Service W32Time | Select-Object Name,Status | Format-Table -AutoSize | Out-String", 30)
 
 
+# ---------------------------------------------------------------------------
+# USB / PnP
+# ---------------------------------------------------------------------------
+
 def _usb_instance_id(arguments: dict, allow_prefixes: tuple[str, ...]) -> str | None:
     value = str(arguments.get("instance_id", "")).strip().strip('"')
     upper = value.upper()
@@ -260,7 +277,6 @@ def _usb_instance_id(arguments: dict, allow_prefixes: tuple[str, ...]) -> str | 
 
 
 def check_usb_devices(_: dict) -> ToolResult:
-    # Win32_PnPEntity exposes the Windows PnP state and ConfigManagerErrorCode.
     script = r'''
 $devices = Get-CimInstance Win32_PnPEntity -ErrorAction Stop |
     Where-Object { $_.PNPDeviceID -like 'USB\*' } |
@@ -316,66 +332,200 @@ def restart_usb_controller(arguments: dict) -> ToolResult:
     return _run_cmd(["pnputil", "/restart-device", instance_id], 45)
 
 
-TOOLS: dict[str, ToolDefinition] = {
-    "check_adapter_state": ToolDefinition("check_adapter_state", "DIAGNOSTIC", "Inspect Windows network adapters.", False, check_adapter_state),
-    "check_ip_config": ToolDefinition("check_ip_config", "DIAGNOSTIC", "Inspect IP, gateway and DNS configuration.", False, check_ip_config),
-    "check_gateway": ToolDefinition("check_gateway", "DIAGNOSTIC", "Test reachability of the configured default gateway.", False, check_gateway),
-    "check_internet_ip": ToolDefinition("check_internet_ip", "DIAGNOSTIC", "Test end-to-end Internet reachability.", False, check_internet_ip),
-    "check_dns": ToolDefinition("check_dns", "DIAGNOSTIC", "Test DNS resolution.", False, check_dns),
-    "enable_adapter": ToolDefinition("enable_adapter", "FIX", "Enable a verified disabled network adapter.", True, enable_adapter),
-    "fix_renew_dhcp": ToolDefinition("fix_renew_dhcp", "FIX", "Renew DHCP configuration when the KB evidence supports it.", True, fix_renew_dhcp),
-    "fix_flush_dns": ToolDefinition("fix_flush_dns", "FIX", "Flush the Windows DNS resolver cache.", True, fix_flush_dns),
-    "fix_reset_winsock": ToolDefinition("fix_reset_winsock", "FIX", "Reset Winsock when permitted by the selected KB.", True, fix_reset_winsock),
-    "fix_reset_tcpip": ToolDefinition("fix_reset_tcpip", "FIX", "Reset TCP/IP when permitted by the selected KB.", True, fix_reset_tcpip),
+# ---------------------------------------------------------------------------
+# CPU / memory / performance
+# ---------------------------------------------------------------------------
 
-    "check_not_responding_apps": ToolDefinition("check_not_responding_apps", "DIAGNOSTIC", "Find visible Windows applications reported as Not Responding.", False, check_not_responding_apps),
-    "close_unresponsive_app": ToolDefinition(
-        "close_unresponsive_app",
-        "FIX",
-        "Close the verified unresponsive application identified by diagnostic evidence.",
-        True,
-        close_unresponsive_app,
-        "{\"pid\": \"PID from check_not_responding_apps\", \"process_name\": \"optional process name\"}",
-    ),
-
-    "check_windows_update_status": ToolDefinition("check_windows_update_status", "DIAGNOSTIC", "Inspect Windows Update service and update state.", False, check_windows_update_status),
-    "check_windows_update_services": ToolDefinition("check_windows_update_services", "DIAGNOSTIC", "Inspect required Windows Update services.", False, check_windows_update_services),
-    "check_pending_reboot": ToolDefinition("check_pending_reboot", "DIAGNOSTIC", "Check whether Windows is waiting for a reboot.", False, check_pending_reboot),
-    "check_windows_update_error": ToolDefinition("check_windows_update_error", "DIAGNOSTIC", "Inspect recent Windows UpdateClient errors.", False, check_windows_update_error),
-    "fix_restart_update_services": ToolDefinition("fix_restart_update_services", "FIX", "Restart relevant Windows Update services.", True, fix_restart_update_services),
-    "fix_reset_windows_update_components": ToolDefinition("fix_reset_windows_update_components", "FIX", "Reset Windows Update component directories and restart services.", True, fix_reset_windows_update_components),
-
-    "check_time_status": ToolDefinition("check_time_status", "DIAGNOSTIC", "Inspect current Windows time, timezone and sync state.", False, check_time_status),
-    "check_time_service": ToolDefinition("check_time_service", "DIAGNOSTIC", "Inspect Windows Time service state.", False, check_time_service),
-    "check_time_source": ToolDefinition("check_time_source", "DIAGNOSTIC", "Inspect the configured Windows time source.", False, check_time_source),
-    "fix_sync_time": ToolDefinition("fix_sync_time", "FIX", "Request Windows time synchronization.", True, fix_sync_time),
-    "fix_restart_time_service": ToolDefinition("fix_restart_time_service", "FIX", "Restart the Windows Time service.", True, fix_restart_time_service),
-
-    "check_usb_devices": ToolDefinition("check_usb_devices", "DIAGNOSTIC", "Inspect currently enumerated USB Plug and Play devices and problem codes.", False, check_usb_devices),
-    "scan_usb_devices": ToolDefinition("scan_usb_devices", "DIAGNOSTIC", "Ask Windows Plug and Play to rescan for hardware changes.", False, scan_usb_devices),
-    "check_usb_controllers": ToolDefinition("check_usb_controllers", "DIAGNOSTIC", "Inspect USB host controller and root hub entries and problem codes.", False, check_usb_controllers),
-    "enable_usb_device": ToolDefinition(
-        "enable_usb_device",
-        "FIX",
-        "Enable a verified disabled USB device.",
-        True,
-        enable_usb_device,
-        "{\"instance_id\": \"exact USB instance ID from the latest diagnostic\"}",
-    ),
-    "restart_usb_device": ToolDefinition(
-        "restart_usb_device",
-        "FIX",
-        "Restart a verified USB device using its exact instance ID.",
-        True,
-        restart_usb_device,
-        "{\"instance_id\": \"exact USB instance ID from the latest diagnostic\"}",
-    ),
-    "restart_usb_controller": ToolDefinition(
-        "restart_usb_controller",
-        "FIX",
-        "Restart a verified USB host controller/root hub using its exact instance ID.",
-        True,
-        restart_usb_controller,
-        "{\"instance_id\": \"exact USB or PCI controller instance ID from the latest diagnostic\"}",
-    ),
+def check_system_performance(_: dict) -> ToolResult:
+    script = r'''
+$os = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop
+$cs = Get-CimInstance Win32_ComputerSystem -ErrorAction Stop
+$cpu = Get-CimInstance Win32_Processor -ErrorAction Stop |
+    Measure-Object -Property LoadPercentage -Average
+$totalMemoryMB = [math]::Round($cs.TotalPhysicalMemory / 1MB, 0)
+$freeMemoryMB = [math]::Round($os.FreePhysicalMemory / 1024, 0)
+$usedMemoryMB = $totalMemoryMB - $freeMemoryMB
+$usedMemoryPct = if ($totalMemoryMB -gt 0) { [math]::Round(($usedMemoryMB / $totalMemoryMB) * 100, 1) } else { 0 }
+$commit = try { Get-Counter '\\Memory\\% Committed Bytes In Use' -ErrorAction Stop | Select-Object -ExpandProperty CounterSamples | Select-Object -First 1 } catch { $null }
+$systemDrive = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$env:SystemDrive'" -ErrorAction SilentlyContinue
+Write-Output "CPU load average: $([math]::Round($cpu.Average,1))%"
+Write-Output "Physical memory total: $totalMemoryMB MB"
+Write-Output "Physical memory available: $freeMemoryMB MB"
+Write-Output "Physical memory used: $usedMemoryMB MB ($usedMemoryPct%)"
+if ($commit) { Write-Output "Committed memory in use: $([math]::Round($commit.CookedValue,1))%" }
+if ($systemDrive) {
+    $freeGB = [math]::Round($systemDrive.FreeSpace / 1GB, 2)
+    $sizeGB = [math]::Round($systemDrive.Size / 1GB, 2)
+    $usedGB = [math]::Round($sizeGB - $freeGB, 2)
+    Write-Output "System drive: $env:SystemDrive"
+    Write-Output "System drive free: $freeGB GB of $sizeGB GB"
+    Write-Output "System drive used: $usedGB GB"
 }
+Write-Output "Processor count: $([Environment]::ProcessorCount) logical processors"
+'''
+    return _run_ps(script, 30)
+
+
+def check_top_cpu_processes(_: dict) -> ToolResult:
+    script = r'''
+$cores = [Environment]::ProcessorCount
+$before = @{}
+Get-Process -ErrorAction SilentlyContinue | ForEach-Object {
+    try { $before[$_.Id] = $_.TotalProcessorTime.TotalSeconds } catch {}
+}
+Start-Sleep -Seconds 1
+$rows = foreach ($p in Get-Process -ErrorAction SilentlyContinue) {
+    try {
+        if ($before.ContainsKey($p.Id)) {
+            $delta = $p.TotalProcessorTime.TotalSeconds - $before[$p.Id]
+            $pct = [math]::Round(($delta / $cores) * 100, 1)
+            [pscustomobject]@{
+                ProcessName = $p.ProcessName
+                Id = $p.Id
+                CPUPercent = $pct
+            }
+        }
+    } catch {}
+}
+$rows | Sort-Object CPUPercent -Descending | Select-Object -First 15 | Format-Table -AutoSize | Out-String
+'''
+    return _run_ps(script, 45)
+
+
+def check_top_memory_processes(_: dict) -> ToolResult:
+    script = r'''
+Get-Process -ErrorAction SilentlyContinue |
+    Select-Object ProcessName,Id,
+        @{Name='WorkingSetMB';Expression={[math]::Round($_.WorkingSet64 / 1MB, 1)}},
+        @{Name='PrivateMemoryMB';Expression={[math]::Round($_.PrivateMemorySize64 / 1MB, 1)}} |
+    Sort-Object WorkingSetMB -Descending |
+    Select-Object -First 15 |
+    Format-Table -AutoSize | Out-String
+'''
+    return _run_ps(script, 30)
+
+
+def check_disk_space(_: dict) -> ToolResult:
+    script = r'''
+$disks = Get-CimInstance Win32_LogicalDisk -Filter "DriveType=3" -ErrorAction Stop |
+    Select-Object DeviceID,
+        @{Name='SizeGB';Expression={[math]::Round($_.Size / 1GB, 2)}},
+        @{Name='FreeGB';Expression={[math]::Round($_.FreeSpace / 1GB, 2)}},
+        @{Name='FreePercent';Expression={if ($_.Size) {[math]::Round(($_.FreeSpace / $_.Size) * 100, 1)} else {0}}}
+$disks | Format-Table -AutoSize | Out-String
+'''
+    return _run_ps(script, 30)
+
+
+def check_startup_apps(_: dict) -> ToolResult:
+    script = r'''
+$items = Get-CimInstance Win32_StartupCommand -ErrorAction Stop |
+    Select-Object Name,Command,Location,User
+if (-not $items) {
+    Write-Output "No startup applications were reported by Windows."
+    exit 0
+}
+$items | Sort-Object Name | Format-List | Out-String
+'''
+    return _run_ps(script, 45)
+
+
+def close_high_resource_process(args: dict) -> ToolResult:
+    pid = str(args.get("pid", "")).strip()
+    if not pid.isdigit() or int(pid) <= 4:
+        return ToolResult(False, "A valid non-system process PID from the performance diagnostics is required.")
+
+    script = f'''
+$targetId = {int(pid)}
+$target = Get-CimInstance Win32_Process -Filter "ProcessId=$targetId" -ErrorAction Stop
+if (-not $target) {{ throw "Target process no longer exists." }}
+$currentSession = (Get-Process -Id $PID -ErrorAction Stop).SessionId
+if ([int]$target.SessionId -ne [int]$currentSession) {{ throw "The target process is not in the current interactive user session." }}
+$owner = Invoke-CimMethod -InputObject $target -MethodName GetOwner -ErrorAction SilentlyContinue
+if ($owner.User -and $owner.User -ne $env:USERNAME) {{ throw "The target process is owned by another user account." }}
+Write-Output "Target: $($target.Name) (PID $targetId)"
+Write-Output "Owner: $($owner.User)"
+Write-Output "Session: $($target.SessionId)"
+Stop-Process -Id $targetId -Force -ErrorAction Stop
+Write-Output "Process terminated."
+'''
+    return _run_ps(script, 30)
+
+
+def restart_computer(_: dict) -> ToolResult:
+    return _run_ps("Restart-Computer -Force", 30)
+
+
+def disable_startup_app(args: dict) -> ToolResult:
+    name = str(args.get("name", "")).strip()
+    location = str(args.get("location", "")).strip()
+    if not name or not location:
+        return ToolResult(False, "The startup app name and exact startup location from diagnostics are required.")
+
+    safe_name = name.replace("'", "''")
+    safe_location = location.replace("'", "''")
+    script = f'''
+$name = '{safe_name}'
+$location = '{safe_location}'
+if ($location -match '^HKCU\\\\Software\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\Run$') {{
+    Remove-ItemProperty -Path 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run' -Name $name -ErrorAction Stop
+    Write-Output "Disabled startup entry '$name' for the current user."
+}} elseif ($location -match '^HKLM\\\\Software\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\Run$') {{
+    Remove-ItemProperty -Path 'HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run' -Name $name -ErrorAction Stop
+    Write-Output "Disabled startup entry '$name' for the computer."
+}} else {{
+    throw "This startup location is not supported by the L1 disable tool: $location"
+}}
+'''
+    return _run_ps(script, 30)
+
+
+def clean_temporary_files(_: dict) -> ToolResult:
+    script = r'''
+$root = $env:TEMP
+if (-not (Test-Path $root)) { Write-Output "User temporary directory not found: $root"; exit 0 }
+$before = (Get-ChildItem -LiteralPath $root -Force -ErrorAction SilentlyContinue | Measure-Object).Count
+$removed = 0
+Get-ChildItem -LiteralPath $root -Force -ErrorAction SilentlyContinue | ForEach-Object {
+    try {
+        Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction Stop
+        $removed++
+    } catch {
+        # Locked/in-use temporary files are expected and are left alone.
+    }
+}
+$after = (Get-ChildItem -LiteralPath $root -Force -ErrorAction SilentlyContinue | Measure-Object).Count
+Write-Output "User temporary directory: $root"
+Write-Output "Entries before cleanup: $before"
+Write-Output "Entries removed: $removed"
+Write-Output "Entries remaining: $after"
+'''
+    return _run_ps(script, 60)
+
+
+# ---------------------------------------------------------------------------
+# Dynamic execution
+# ---------------------------------------------------------------------------
+
+def resolve_tool(name: str) -> Callable[[dict], ToolResult] | None:
+    """Resolve an exact tool name to a function defined in this module.
+
+    There is deliberately no central tool-name registry. The selected KB tells
+    the agent which names are valid for the workflow; Python only resolves the
+    exact name to an implemented callable and executes it.
+    """
+    value = globals().get(name)
+    if not callable(value):
+        return None
+    if name.startswith("_"):
+        return None
+    if getattr(value, "__module__", None) != __name__:
+        return None
+    return value
+
+
+def run_tool(name: str, arguments: dict) -> ToolResult:
+    runner = resolve_tool(name)
+    if runner is None:
+        raise KeyError(name)
+    return runner(arguments)

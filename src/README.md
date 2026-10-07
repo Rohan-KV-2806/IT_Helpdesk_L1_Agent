@@ -39,9 +39,9 @@ Load that exact Markdown KB
         ↓
 LLM reads the KB and chooses one exact tool documented by that KB
         ↓
-Python validates that the tool exists and is referenced by the KB
+Python resolves the exact tool name to its executable implementation
         ↓
-Python executes the registered implementation
+Python executes it
         ↓
 Actual result returns to the LLM
         ↓
@@ -54,13 +54,11 @@ Python does **not** encode rules such as "Internet → internet_connectivity.md"
 
 To add another knowledge base, place another `.md` file in `KnowledgeBase/`. The classifier will discover the new filename automatically. The KB should document its own troubleshooting workflow and exact tool names.
 
-## Tool registry
+## Tool execution
 
-`helpdesk_agent/tools/registry.py` contains the real Python implementations of executable tools. This registry is a capability layer, not a troubleshooting decision tree.
+There is no central tool registry or category-to-tool mapping. The selected KB provides the executable tool names and their diagnostic/fix sections. The application resolves each exact name to a Python function with the same name. A new KB therefore does not require changes to classification or workflow routing. A new executable capability still needs a Python implementation with the exact name used by the KB.
 
-A tool is executable for a session only when its exact identifier is documented in the selected KB and the same identifier exists in the registry.
-
-State-changing tools require the existing GUI Yes/No approval dialog. The LLM must return the FIX action itself; it must not request fix approval through ASK_USER.
+All FIX actions require the existing GUI Yes/No approval dialog.
 
 ## Internal failures
 
@@ -69,3 +67,4 @@ Invalid model output, missing tools, malformed arguments, and similar applicatio
 ## Knowledge bases
 
 The source does not bundle a hardcoded list of KB files. Copy your `.md` files into the project-root `KnowledgeBase/` directory.
+

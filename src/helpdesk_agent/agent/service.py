@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Callable
 
@@ -7,7 +8,7 @@ from ..config import KB_ROOT, MAX_AGENT_STEPS, REPORTS_ROOT, SYSTEM_PROMPT
 from ..knowledge.store import build_kb_catalog, discover_kbs, load_kb
 from ..llm.provider import ModelProvider, parse_json_object
 from ..ticketing.service import create_ticket, save_report
-from ..tools.registry import TOOLS, ToolDefinition, ToolResult
+from ..tools.actions import ToolResult, resolve_tool
 
 
 @dataclass
@@ -63,14 +64,11 @@ class AgentService:
             on_event(AgentEvent("internal_error", str(exc)))
             return
 
-        referenced_tools = self._referenced_registered_tools(kb)
-        if not referenced_tools:
-            on_event(
-                AgentEvent(
-                    "internal_error",
-                    f"The selected KB '{kb_filename}' does not reference any executable tools registered by the application.",
-                )
-            )
+        # The KB defines the executable action names and whether each one is a
+        # diagnostic or a fix. Python does not maintain a category-specific map.
+        kb_tools = self._parse_kb_tools(kb)
+        if not kb_tools:
+            on_event(AgentEvent("internal_error", f"The selected KB '{kb_filename}' does not define any executable diagnostic or fix tools."))
             return
 
         completed_tools: list[str] = []
@@ -78,16 +76,17 @@ class AgentService:
         for step in range(1, MAX_AGENT_STEPS + 1):
             on_event(AgentEvent("status", f"Step {step}: deciding next action…"))
 
-            context = self._build_context(kb_filename, kb, problem, history, referenced_tools)
+            context = self._build_context(kb_filename, kb, problem, history, kb_tools)
             try:
                 result = self.provider.complete(SYSTEM_PROMPT, context, backend)
                 try:
                     data = parse_json_object(result.content)
                 except Exception:
-                    # A transient malformed/empty response is an application/model
-                    # formatting failure. Ask once more with the same KB and state,
-                    # explicitly restating the required JSON-only protocol.
-                    retry_context = context + "\n\nFORMAT CORRECTION: Your previous response was not valid JSON. Return exactly one complete JSON object matching the troubleshooting output contract. Do not include prose, markdown, or reasoning outside the JSON object."
+                    retry_context = context + (
+                        "\n\nFORMAT CORRECTION: Your previous response was not valid JSON. "
+                        "Return exactly one complete JSON object matching the troubleshooting output contract. "
+                        "Do not include prose, markdown, or reasoning outside the JSON object."
+                    )
                     retry_result = self.provider.complete(SYSTEM_PROMPT, retry_context, backend)
                     data = parse_json_object(retry_result.content)
                     on_event(AgentEvent("model", f"{retry_result.backend} corrected decision received.", {"raw": retry_result.content}))
@@ -116,11 +115,12 @@ class AgentService:
                 if action:
                     on_event(AgentEvent("internal_error", "ASK_USER must not contain a tool action."))
                     return
-                # This UI handles fix approval itself through the GUI dialog. A
-                # model ASK_USER response therefore cannot be allowed to turn into
-                # a new chat classification. Give the model one protocol-level
-                # correction and let it choose the next KB-defined action again.
-                retry_context = context + "\n\nPROTOCOL CORRECTION: ASK_USER is only for information or a user/physical test required by the knowledge base. It must never be used to request approval for a FIX. The application handles FIX approval through its Yes/No dialog. Reconsider the next action and return exactly one JSON decision."
+                retry_context = context + (
+                    "\n\nPROTOCOL CORRECTION: ASK_USER is only for information or a user/physical test "
+                    "explicitly required by the knowledge base. It must never be used to request approval for a FIX. "
+                    "The application handles FIX approval through its Yes/No dialog. Reconsider the next action "
+                    "and return exactly one JSON decision."
+                )
                 try:
                     retry_result = self.provider.complete(SYSTEM_PROMPT, retry_context, backend)
                     data = parse_json_object(retry_result.content)
@@ -160,13 +160,7 @@ class AgentService:
                     "message": message or "The issue appears to be resolved.",
                 }
                 path = save_report(report, REPORTS_ROOT)
-                on_event(
-                    AgentEvent(
-                        "resolved",
-                        report["message"],
-                        {"report_path": str(path), "report": report},
-                    )
-                )
+                on_event(AgentEvent("resolved", report["message"], {"report_path": str(path), "report": report}))
                 return
 
             if action_type == "ESCALATE":
@@ -193,13 +187,7 @@ class AgentService:
                     "ticket_reason": ticket_reason,
                 }
                 save_report(report, REPORTS_ROOT)
-                on_event(
-                    AgentEvent(
-                        "ticket",
-                        f"Ticket created: {ticket_id}",
-                        {"ticket_id": ticket_id, "path": str(path), "report": report},
-                    )
-                )
+                on_event(AgentEvent("ticket", f"Ticket created: {ticket_id}", {"ticket_id": ticket_id, "path": str(path), "report": report}))
                 return
 
             if status != "ACTION_REQUIRED":
@@ -210,52 +198,49 @@ class AgentService:
                 on_event(AgentEvent("internal_error", f"Unsupported action type: {action_type}"))
                 return
 
-            # The KB controls WHICH tools are allowed. The registry only supplies
-            # executable implementations and mechanical metadata.
-            if action not in referenced_tools:
+            # Action permission comes from the selected KB, not from Python.
+            if action not in kb_tools:
                 on_event(AgentEvent("internal_error", f"Model selected a tool not documented by the selected KB: {action}"))
                 return
 
-            definition = TOOLS.get(action)
-            if definition is None:
-                on_event(AgentEvent("internal_error", f"KB references a tool that is not registered by the application: {action}"))
+            kb_action_type = kb_tools[action]
+            if kb_action_type != action_type:
+                on_event(AgentEvent("internal_error", f"Action type mismatch for KB tool '{action}'."))
                 return
 
-            if definition.category != action_type:
-                on_event(AgentEvent("internal_error", f"Action type mismatch for tool '{action}'."))
+            # Resolve the exact tool name to a Python function. There is no
+            # central tool registry; the function name itself is the binding.
+            runner = resolve_tool(action)
+            if runner is None:
+                on_event(AgentEvent("internal_error", f"The selected KB requires tool '{action}', but no Python implementation exists for that exact tool name."))
                 return
 
-            # A diagnostic should not be repeated accidentally. The one allowed
-            # exception is the diagnostic immediately following a FIX, because
-            # every state-changing action must be verified by the KB.
-            if definition.category == "DIAGNOSTIC" and action in completed_tools:
+            if kb_action_type == "DIAGNOSTIC" and action in completed_tools:
                 previous_tool = history[-1]["tool"] if history else None
-                previous_definition = TOOLS.get(previous_tool) if previous_tool else None
-                if not (previous_definition and previous_definition.category == "FIX"):
+                previous_type = kb_tools.get(previous_tool) if previous_tool else None
+                if previous_type != "FIX":
                     on_event(AgentEvent("internal_error", f"The diagnostic '{action}' was already completed and is not a valid repeated step."))
                     return
 
-            if definition.category == "FIX" and not self._has_successful_diagnostic(history):
+            if kb_action_type == "FIX" and not self._has_successful_diagnostic(history, kb_tools):
                 on_event(AgentEvent("internal_error", "A state-changing tool was selected before a successful diagnostic."))
                 return
 
-            if action in completed_tools and definition.category == "FIX":
+            if action in completed_tools and kb_action_type == "FIX":
                 on_event(AgentEvent("internal_error", f"The same fix was already attempted: {action}"))
                 return
 
-            if definition.requires_approval:
-                approved = request_approval(
-                    action,
-                    message or definition.description,
-                    reason,
-                )
+            # Every KB-defined FIX is treated as state-changing. The GUI owns
+            # the approval interaction and returns only True/False here.
+            if kb_action_type == "FIX":
+                approved = request_approval(action, message or f"Run KB-defined fix: {action}", reason)
                 if not approved:
                     on_event(AgentEvent("status", "Fix declined. No ticket was created."))
                     return
 
             on_event(AgentEvent("tool", f"Running {action}…", {"tool": action, "arguments": arguments}))
             try:
-                tool_result: ToolResult = definition.runner(arguments)
+                tool_result: ToolResult = runner(arguments)
             except Exception as exc:
                 on_event(AgentEvent("internal_error", f"Tool '{action}' failed inside the application: {exc}"))
                 return
@@ -269,20 +254,9 @@ class AgentService:
                     "output": tool_result.output[:6000],
                 }
             )
-            on_event(
-                AgentEvent(
-                    "tool_result",
-                    tool_result.output or "(no output)",
-                    {"tool": action, "success": tool_result.success},
-                )
-            )
+            on_event(AgentEvent("tool_result", tool_result.output or "(no output)", {"tool": action, "success": tool_result.success}))
 
-        on_event(
-            AgentEvent(
-                "internal_error",
-                f"The agent reached the maximum of {MAX_AGENT_STEPS} reasoning steps without a final KB decision. No ticket was created because this is an internal agent failure.",
-            )
-        )
+        on_event(AgentEvent("internal_error", f"The agent reached the maximum of {MAX_AGENT_STEPS} reasoning steps without a final KB decision. No ticket was created because this is an internal agent failure."))
 
     def _classify(self, problem: str, backend: str):
         candidates = discover_kbs()
@@ -320,10 +294,33 @@ USER REQUEST:
         return value.rstrip(".! ")
 
     @staticmethod
-    def _referenced_registered_tools(kb: str) -> set[str]:
-        # The KB remains authoritative: only exact registered tool identifiers
-        # that actually occur in the KB are executable for that session.
-        return {name for name in TOOLS if f"`{name}`" in kb}
+    def _parse_kb_tools(kb: str) -> dict[str, str]:
+        """Parse executable tool names directly from the KB's AVAILABLE TOOLS section."""
+        match = re.search(r"(?ms)^##\s+\d+\.\s+AVAILABLE TOOLS\b(.*?)(?=^##\s+|\Z)", kb)
+        section = match.group(1) if match else kb
+        tools: dict[str, str] = {}
+        current_type: str | None = None
+
+        for line in section.splitlines():
+            heading = re.match(r"^###\s+(.+?)\s*$", line)
+            if heading:
+                title = heading.group(1).lower()
+                if "diagnostic" in title:
+                    current_type = "DIAGNOSTIC"
+                elif "fix" in title or "l1 action" in title or "l1 fix" in title:
+                    current_type = "FIX"
+                else:
+                    current_type = None
+                continue
+
+            if current_type is None:
+                continue
+
+            cell = re.match(r"^\|\s*`([A-Za-z_][A-Za-z0-9_]*)`\s*\|", line)
+            if cell:
+                tools[cell.group(1)] = current_type
+
+        return tools
 
     @staticmethod
     def _build_context(
@@ -331,7 +328,7 @@ USER REQUEST:
         kb: str,
         problem: str,
         history: list[dict],
-        referenced_tools: set[str],
+        kb_tools: dict[str, str],
     ) -> str:
         history_text = "None" if not history else "\n\n".join(
             f"Step {i}: {item['tool']} | success={item['success']}\n"
@@ -339,18 +336,7 @@ USER REQUEST:
             f"{item['output']}"
             for i, item in enumerate(history, 1)
         )
-
-        tool_metadata = "None"
-        if referenced_tools:
-            entries = []
-            for name in sorted(referenced_tools):
-                definition = TOOLS[name]
-                args = definition.argument_hints or "No arguments required."
-                entries.append(
-                    f"- {definition.name}: type={definition.category}; approval={definition.requires_approval}; "
-                    f"description={definition.description}; arguments={args}"
-                )
-            tool_metadata = "\n".join(entries)
+        tool_names = "\n".join(f"- {name}: {tool_type}" for name, tool_type in sorted(kb_tools.items()))
 
         return f'''SELECTED KNOWLEDGE-BASE FILE:
 {kb_filename}
@@ -358,8 +344,8 @@ USER REQUEST:
 KNOWLEDGE BASE (SOURCE OF TRUTH):
 {kb}
 
-RUNTIME TOOL METADATA (MECHANICAL ONLY):
-{tool_metadata}
+EXECUTABLE ACTION NAMES DISCOVERED FROM THIS KB:
+{tool_names}
 
 USER REQUEST:
 {problem}
@@ -367,18 +353,14 @@ USER REQUEST:
 ACTUAL TOOL HISTORY:
 {history_text}
 
-Choose exactly ONE next action. Follow the knowledge base exactly. The Python application will execute only exact tools documented by the selected KB. For a state-changing FIX, return the FIX action itself; the application will handle approval in its Yes/No dialog. Do not use ASK_USER for FIX approval.'''
+Choose exactly ONE next action. Follow the knowledge base exactly. The Python application will execute only an exact action name documented by this selected KB and for which a Python implementation exists. For any FIX action, the application will show its Yes/No approval dialog automatically. Do not use ASK_USER to request FIX approval.'''
 
     @staticmethod
-    def _has_successful_diagnostic(history: list[dict]) -> bool:
-        # Generic safety barrier only: changing system state requires prior
-        # evidence from at least one successfully completed diagnostic.
-        for item in history:
-            if item.get("success") and item.get("tool") in TOOLS:
-                definition = TOOLS[item["tool"]]
-                if definition.category == "DIAGNOSTIC":
-                    return True
-        return False
+    def _has_successful_diagnostic(history: list[dict], kb_tools: dict[str, str]) -> bool:
+        return any(
+            item.get("success") and kb_tools.get(item.get("tool")) == "DIAGNOSTIC"
+            for item in history
+        )
 
     @staticmethod
     def _unsupported_message() -> str:

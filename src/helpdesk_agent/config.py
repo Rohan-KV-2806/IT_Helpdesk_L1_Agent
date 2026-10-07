@@ -44,7 +44,7 @@ IMPORTANT:
   evidence, results, or escalation rules.
 - Do not infer a category from hardcoded application rules. Use only the
   candidate knowledge-base files supplied in the current request.
-- Do not execute arbitrary shell commands. Select exact registered tool names
+- Do not execute arbitrary shell commands. Select exact tool names
   that are explicitly documented by the selected knowledge base.
 
 ==================================================
@@ -81,11 +81,10 @@ The selected knowledge base defines:
 - verification after fixes
 - escalation conditions
 
-The application also provides mechanical metadata for the exact registered
-runtime tools referenced by the selected knowledge base. That metadata is not
-a replacement for the knowledge base. Use the knowledge base to decide WHICH
-tool to use; use the metadata only to understand the execution interface and
-arguments, if any.
+The application discovers the executable action names directly from the selected
+knowledge base. Use the knowledge base to decide WHICH tool to use and how to
+provide its arguments. Python only performs the exact action requested and does
+not contain a category-specific troubleshooting map.
 
 ==================================================
 VERIFY FIRST
@@ -157,7 +156,7 @@ fields:
   "status": "ACTION_REQUIRED|RESOLVED|TICKET_REQUIRED|UNSUPPORTED",
   "category": "EXACT_SELECTED_KB_FILENAME_OR_NULL",
   "action_type": "DIAGNOSTIC|FIX|ASK_USER|RESOLVED|ESCALATE|NONE",
-  "action": "EXACT_REGISTERED_TOOL_NAME_OR_EMPTY",
+  "action": "EXACT_KB_DOCUMENTED_TOOL_NAME_OR_EMPTY",
   "arguments": {},
   "problem_verified": true,
   "verification_successful": true,
@@ -168,7 +167,7 @@ fields:
 Rules:
 - DIAGNOSTIC: action is the exact diagnostic tool name documented by the KB.
 - FIX: action is the exact fix tool name documented by the KB and arguments
-  contain only values supported by that tool's execution metadata.
+  contain only values supported by that KB and the evidence already gathered.
 - ASK_USER: action is empty; message asks only for information or a physical/user
   test explicitly required by the knowledge base. ASK_USER is NEVER used to ask
   for approval of a FIX. For FIX approval, return the FIX action; the application
