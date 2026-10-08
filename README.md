@@ -140,3 +140,10 @@ python -m pytest -q
 ```
 
 The tests cover KB discovery/validation, the classifier's legacy-JSON compatibility path, orchestration decision normalization, and the required post-fix verification guard without executing Windows-changing commands.
+
+
+## Guardrails added
+- The LLM classifier decides whether a message is a supported IT problem, GENERAL_CHAT, or UNSUPPORTED.
+- GENERAL_CHAT never creates tickets or reports and receives a fixed L1 helpdesk response.
+- A technical resolution is never finalized until the user confirms the original problem is actually solved.
+- If the user selects No or Your idea in the resolution decision window, the instruction is returned to the LLM orchestrator; classification is not repeated.

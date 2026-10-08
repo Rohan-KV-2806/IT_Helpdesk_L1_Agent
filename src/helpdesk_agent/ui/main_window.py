@@ -69,22 +69,31 @@ class AgentWorker(QThread):
 class DecisionDialog(QDialog):
     def __init__(self, parent, action: str, message: str, reason: str):
         super().__init__(parent)
-        self.setWindowTitle("L1 Fix Decision")
+        self.is_resolution_confirmation = action == "CONFIRM_RESOLUTION"
+        self.setWindowTitle("Problem Solved?") if self.is_resolution_confirmation else self.setWindowTitle("L1 Fix Decision")
         self.setModal(True)
         self.setMinimumWidth(520)
         self.choice = ApprovalResponse("no", "")
 
         layout = QVBoxLayout(self)
-        title = QLabel(f"Proposed action: {action}")
+        if self.is_resolution_confirmation:
+            title = QLabel("Is your problem solved?")
+            body_text = f"{message}\n\nReason: {reason}\n\nPlease confirm whether the original problem is actually gone."
+        else:
+            title = QLabel(f"Proposed action: {action}")
+            body_text = f"{message}\n\nReason: {reason}\n\nAllow this action to run?"
         title.setStyleSheet("font-weight: 650; font-size: 14px;")
         layout.addWidget(title)
 
-        body = QLabel(f"{message}\n\nReason: {reason}\n\nAllow this action to run?")
+        body = QLabel(body_text)
         body.setWordWrap(True)
         layout.addWidget(body)
 
         self.idea = QPlainTextEdit()
-        self.idea.setPlaceholderText("Tell the L1 agent what you want it to consider instead…")
+        if self.is_resolution_confirmation:
+            self.idea.setPlaceholderText("Tell the L1 agent what is still wrong or what you want it to try next…")
+        else:
+            self.idea.setPlaceholderText("Tell the L1 agent what you want it to consider instead…")
         self.idea.setFixedHeight(75)
         layout.addWidget(self.idea)
 
@@ -226,6 +235,7 @@ class MainWindow(QMainWindow):
             "resolved": "Agent",
             "ticket": "Ticket",
             "unsupported": "Agent",
+            "general_chat": "Agent",
             "ask": "Agent",
             "internal_error": "Error",
         }

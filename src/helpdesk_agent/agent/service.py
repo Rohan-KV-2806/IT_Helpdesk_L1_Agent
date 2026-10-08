@@ -61,7 +61,16 @@ class AgentService:
 
         try:
             kb_id = self._classify(problem, backend)
-            on_event(AgentEvent("classification", f"Knowledge base: {kb_id}", {"category": kb_id, "backend": backend}))
+            on_event(AgentEvent("classification", f"Classification: {kb_id}", {"category": kb_id, "backend": backend}))
+            if kb_id == "GENERAL_CHAT":
+                on_event(
+                    AgentEvent(
+                        "general_chat",
+                        "Hello. I'm your L1 IT Helpdesk Agent. Please tell me the IT problem you'd like me to check or troubleshoot.",
+                        {"backend": backend},
+                    )
+                )
+                return
             kb = load_kb(kb_id)
         except UnsupportedRequest as exc:
             self._handle_unsupported(problem, str(exc), on_event)
@@ -97,6 +106,7 @@ class AgentService:
         post_fix_verification_required = False
         last_verification_success = True
         last_diagnostic_success = False
+        resolution_declined = False
 
         for step in range(1, MAX_AGENT_STEPS + 1):
             on_event(AgentEvent("status", f"Step {step}: LLM deciding next action…"))
@@ -177,15 +187,58 @@ class AgentService:
                             return
                         decision_type = "tool_call"
                     else:
-                        report = self._make_resolved_report(
-                            problem=problem,
-                            kb_id=kb_id,
-                            history=history,
-                            decision=normalized,
-                        )
-                        save_report(report, REPORTS_ROOT)
-                        on_event(AgentEvent("resolved", normalized["message"], {"report": report}))
-                        return
+                        # Do not assume that successful technical verification means
+                        # the human's original symptom is gone. Give the user the final
+                        # say through the same decision window used for state changes.
+                        if resolution_declined:
+                            repaired = self._repair_decision(
+                                context,
+                                backend,
+                                "The user explicitly said the problem is NOT solved. Do not declare RESOLVED again. Choose another KB-supported diagnostic/fix, ask for the required user test, or escalate.",
+                            )
+                            if repaired is None:
+                                on_event(AgentEvent("internal_error", "LLM could not continue after the user reported that the problem remains."))
+                                return
+                            try:
+                                normalized = self._normalize_decision(repaired, kb_id)
+                            except ValueError as exc:
+                                on_event(AgentEvent("internal_error", f"LLM returned an invalid recovery decision: {exc}"))
+                                return
+                            if normalized["decision"] == "resolved":
+                                on_event(AgentEvent("internal_error", "LLM attempted to resolve again after the user said the problem remains."))
+                                return
+                            decision_type = normalized["decision"]
+                        else:
+                            confirmation = request_approval(
+                                "CONFIRM_RESOLUTION",
+                                normalized["message"],
+                                normalized["reason"],
+                            )
+                            if confirmation.choice == "yes":
+                                report = self._make_resolved_report(
+                                    problem=problem,
+                                    kb_id=kb_id,
+                                    history=history,
+                                    decision=normalized,
+                                )
+                                save_report(report, REPORTS_ROOT)
+                                on_event(AgentEvent("resolved", normalized["message"], {"report": report}))
+                                return
+                            if confirmation.choice == "no":
+                                resolution_declined = True
+                                user_feedback.append(
+                                    "USER CONFIRMED THE PROBLEM IS NOT SOLVED. Do not declare resolved. Reconsider the KB evidence and choose another supported action, required user test, or escalation."
+                                )
+                                on_event(AgentEvent("status", "Thanks. I’ll continue troubleshooting instead of marking the issue resolved."))
+                                continue
+                            instruction = confirmation.instruction.strip()
+                            if instruction:
+                                user_feedback.append(f"USER DECISION INSTRUCTION AFTER PROPOSED RESOLUTION: {instruction}")
+                            else:
+                                user_feedback.append("The user chose Your idea but supplied no additional instruction. Continue troubleshooting without making a system change.")
+                            resolution_declined = True
+                            on_event(AgentEvent("status", "Your instruction was sent to the LLM. I’ll continue troubleshooting."))
+                            continue
 
                 # A repair converted a premature RESOLVED decision into a
                 # tool call. Continue through the normal safety/execution path.
@@ -420,6 +473,10 @@ class AgentService:
                 )
             )
 
+            # New evidence makes another resolution confirmation meaningful.
+            # A prior "No" only blocks an immediate repeated resolution claim.
+            resolution_declined = False
+
             if definition.category == "FIX":
                 post_fix_verification_required = True
                 last_verification_success = False
@@ -450,9 +507,11 @@ class AgentService:
         prompt = (
             "AVAILABLE KNOWLEDGE BASES:\n"
             f"{build_kb_catalog()}\n\n"
+            "SPECIAL CLASSIFICATION: GENERAL_CHAT\n"
+            "Use GENERAL_CHAT for greetings, thanks, small talk, or questions about the agent itself that are not an IT support request.\n\n"
             "USER REQUEST:\n"
             f"{problem}\n\n"
-            "RETURN ONLY ONE EXACT KB ID OR UNSUPPORTED."
+            "RETURN ONLY ONE EXACT KB ID, GENERAL_CHAT, OR UNSUPPORTED."
         )
         result = self.provider.complete(CLASSIFIER_SYSTEM_PROMPT, prompt, backend, json_mode=False)
         kb_id = self._extract_kb_id(result.content, candidates)
@@ -463,7 +522,7 @@ class AgentService:
         # troubleshooting JSON envelope during classification.
         repair_prompt = (
             "CLASSIFICATION FORMAT ERROR.\n"
-            f"The candidates are: {', '.join(candidates)}\n"
+            f"The candidates are: {', '.join(candidates)}. You may also return GENERAL_CHAT or UNSUPPORTED.\n"
             f"The previous model response was:\n{result.content[:1200]}\n\n"
             "Return ONLY the exact KB ID or UNSUPPORTED."
         )
@@ -483,6 +542,8 @@ class AgentService:
             return None
 
         aliases = {kb_id.lower(): kb_id for kb_id in candidates}
+        aliases["general_chat"] = "GENERAL_CHAT"
+        aliases["unsupported"] = "UNSUPPORTED"
         cleaned = text.strip("` \"'\t\r\n")
         for prefix in ("kb:", "kb_id:", "knowledge_base:", "category:"):
             if cleaned.lower().startswith(prefix):
