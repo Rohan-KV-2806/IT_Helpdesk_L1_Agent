@@ -53,6 +53,7 @@ class AgentService:
         backend: str,
         on_event: Callable[[AgentEvent], None],
         request_approval: Callable[[str, str, str], ApprovalResponse],
+        request_user_decision: Callable[[str, str, str], ApprovalResponse] | None = None,
     ) -> None:
         problem = problem.strip()
         if not problem:
@@ -101,6 +102,7 @@ class AgentService:
         user_feedback: list[str] = []
         attempted_fixes: set[tuple[str, str]] = set()
         declined_fixes: set[tuple[str, str]] = set()
+        failed_fixes: set[tuple[str, str]] = set()
         repeated_tools: dict[tuple[str, str], int] = {}
         fixes_executed: list[str] = []
         post_fix_verification_required = False
@@ -117,6 +119,8 @@ class AgentService:
                 history=history,
                 allowed=allowed,
                 user_feedback=user_feedback,
+                attempted_fixes=attempted_fixes,
+                failed_fixes=failed_fixes,
                 post_fix_verification_required=post_fix_verification_required,
             )
 
@@ -248,8 +252,29 @@ class AgentService:
                 return
 
             if decision_type == "ask_user":
-                on_event(AgentEvent("ask", normalized["message"], {"reason": normalized["reason"]}))
-                return
+                # User-input decisions are interactive checkpoints, not dead ends.
+                # Keep them inside the same session so the answer goes directly back
+                # to the orchestrator instead of being classified as a new request.
+                if request_user_decision is None:
+                    on_event(AgentEvent("ask", normalized["message"], {"reason": normalized["reason"]}))
+                    return
+                response = request_user_decision("ASK_USER", normalized["message"], normalized["reason"])
+                if response.choice == "yes":
+                    user_feedback.append(
+                        f"USER CONFIRMED THE PROPOSED USER DECISION: {normalized['message']}"
+                    )
+                elif response.choice == "no":
+                    user_feedback.append(
+                        f"USER DECLINED THE PROPOSED USER DECISION: {normalized['message']}"
+                    )
+                else:
+                    instruction = response.instruction.strip()
+                    if instruction:
+                        user_feedback.append(f"USER DECISION INSTRUCTION: {instruction}")
+                    else:
+                        user_feedback.append("The user chose Your idea but supplied no instruction.")
+                on_event(AgentEvent("status", "Your response was sent to the LLM. Continuing the current troubleshooting session…"))
+                continue
 
             tool_name = normalized["tool"]
             arguments = normalized["arguments"]
@@ -372,42 +397,97 @@ class AgentService:
                     repaired = self._repair_decision(
                         context,
                         backend,
-                        f"The user has already declined '{tool_name}'. Do not propose it again unless the user's latest instruction explicitly requests retrying it.",
+                        f"The exact FIX '{tool_name}' with these exact arguments was already declined. Do not propose the same target again unless the user's latest instruction explicitly asks for that same retry. You MAY use the same FIX capability with a DIFFERENT verified target, choose another supported FIX, ask the user, or escalate.",
                     )
                     if repaired is None:
                         on_event(AgentEvent("internal_error", "LLM repeatedly proposed a declined fix."))
                         return
                     normalized = self._normalize_decision(repaired, kb_id)
-                    if normalized["decision"] != "tool_call" or normalized["tool"] == tool_name:
-                        on_event(AgentEvent("internal_error", "LLM did not move away from a declined fix."))
+                    if normalized["decision"] != "tool_call":
+                        # A diagnostic, user question, or escalation can be a
+                        # legitimate response after a declined FIX. Handle it
+                        # on the next loop rather than treating it as a protocol
+                        # failure.
+                        user_feedback.append(
+                            "The previous FIX target was declined. Continue with the repaired decision without repeating that exact target."
+                        )
+                        if normalized["decision"] == "ask_user":
+                            if request_user_decision is None:
+                                on_event(AgentEvent("ask", normalized["message"], {"reason": normalized["reason"]}))
+                                return
+                            response = request_user_decision("ASK_USER", normalized["message"], normalized["reason"])
+                            if response.choice == "yes":
+                                user_feedback.append(f"USER CONFIRMED THE PROPOSED USER DECISION: {normalized['message']}")
+                            elif response.choice == "no":
+                                user_feedback.append(f"USER DECLINED THE PROPOSED USER DECISION: {normalized['message']}")
+                            elif response.instruction.strip():
+                                user_feedback.append(f"USER DECISION INSTRUCTION: {response.instruction.strip()}")
+                            on_event(AgentEvent("status", "Your response was sent to the LLM. Continuing the current troubleshooting session…"))
+                            continue
+                        if normalized["decision"] == "escalate":
+                            self._handle_escalation(problem, kb_id, history, normalized, on_event)
+                            return
+                        on_event(AgentEvent("internal_error", "LLM returned an unsupported repaired decision after a declined FIX."))
                         return
                     tool_name = normalized["tool"]
                     arguments = normalized["arguments"]
                     phase = normalized["phase"]
-                    definition = self.capabilities[tool_name]
+                    definition = self.capabilities.get(tool_name)
+                    if definition is None or tool_name not in allowed or definition.category != "FIX":
+                        on_event(AgentEvent("internal_error", "LLM did not select another valid FIX after a declined target."))
+                        return
                     fix_key = (tool_name, json.dumps(arguments, sort_keys=True, ensure_ascii=False))
+                    if fix_key in declined_fixes:
+                        on_event(AgentEvent("internal_error", "LLM repeated the same declined FIX target after repair."))
+                        return
 
                 if fix_key in attempted_fixes and not self._feedback_explicitly_retries(user_feedback, tool_name):
                     repaired = self._repair_decision(
                         context,
                         backend,
-                        f"The same FIX '{tool_name}' with the same arguments was already executed. Do not repeat it unless the user explicitly requested a retry; choose another supported action or escalate.",
+                        f"The exact FIX '{tool_name}' with these exact arguments was already attempted. Do not repeat that exact target automatically. You MAY use the same FIX capability with DIFFERENT verified arguments (for example a different application PID), choose another supported action, ask the user, or escalate.",
                     )
                     if repaired is None:
                         on_event(AgentEvent("internal_error", "LLM entered a repeated-fix loop."))
                         return
                     normalized = self._normalize_decision(repaired, kb_id)
-                    if normalized["decision"] != "tool_call" or normalized["tool"] == tool_name:
-                        on_event(AgentEvent("internal_error", "LLM did not move away from the repeated fix."))
+                    if normalized["decision"] != "tool_call":
+                        # This is not necessarily an error: after an attempted
+                        # FIX, the LLM may reasonably ask for a new test, ask the
+                        # user, or escalate. Allow those decisions to proceed
+                        # instead of converting them into an internal error.
+                        if normalized["decision"] == "ask_user":
+                            if request_user_decision is None:
+                                on_event(AgentEvent("ask", normalized["message"], {"reason": normalized["reason"]}))
+                                return
+                            response = request_user_decision("ASK_USER", normalized["message"], normalized["reason"])
+                            if response.choice == "yes":
+                                user_feedback.append(f"USER CONFIRMED THE PROPOSED USER DECISION: {normalized['message']}")
+                            elif response.choice == "no":
+                                user_feedback.append(f"USER DECLINED THE PROPOSED USER DECISION: {normalized['message']}")
+                            elif response.instruction.strip():
+                                user_feedback.append(f"USER DECISION INSTRUCTION: {response.instruction.strip()}")
+                            on_event(AgentEvent("status", "Your response was sent to the LLM. Continuing the current troubleshooting session…"))
+                            continue
+                        if normalized["decision"] == "escalate":
+                            self._handle_escalation(problem, kb_id, history, normalized, on_event)
+                            return
+                        on_event(AgentEvent("internal_error", "LLM returned an unsupported repaired decision after a repeated FIX."))
                         return
-                    tool_name = normalized["tool"]
-                    arguments = normalized["arguments"]
+                    new_tool_name = normalized["tool"]
+                    new_arguments = normalized["arguments"]
+                    new_fix_key = (new_tool_name, json.dumps(new_arguments, sort_keys=True, ensure_ascii=False))
+                    if new_fix_key == fix_key:
+                        on_event(AgentEvent("internal_error", "LLM repeated the exact same FIX target after repair."))
+                        return
+                    tool_name = new_tool_name
+                    arguments = new_arguments
                     phase = normalized["phase"]
-                    definition = self.capabilities[tool_name]
-                    if definition.category != "FIX":
-                        on_event(AgentEvent("internal_error", "LLM changed to a non-fix while repairing a repeated FIX decision."))
+                    definition = self.capabilities.get(tool_name)
+                    if definition is None or tool_name not in allowed or definition.category != "FIX":
+                        on_event(AgentEvent("internal_error", "LLM did not select another valid FIX target after repair."))
                         return
-                    fix_key = (tool_name, json.dumps(arguments, sort_keys=True, ensure_ascii=False))
+                    fix_key = new_fix_key
 
                 if not definition.requires_approval:
                     on_event(AgentEvent("internal_error", f"State-changing capability '{tool_name}' is not approval-gated."))
@@ -435,7 +515,6 @@ class AgentService:
                     continue
 
                 attempted_fixes.add(fix_key)
-                fixes_executed.append(tool_name)
 
             on_event(
                 AgentEvent(
@@ -478,11 +557,25 @@ class AgentService:
             resolution_declined = False
 
             if definition.category == "FIX":
-                post_fix_verification_required = True
-                last_verification_success = False
-                user_feedback.append(
-                    f"Tool result for FIX '{tool_name}': success={result.success}. A verification/test is now mandatory before resolution."
-                )
+                if result.success:
+                    fixes_executed.append(tool_name)
+                    post_fix_verification_required = True
+                    last_verification_success = False
+                    user_feedback.append(
+                        f"Tool result for FIX '{tool_name}': success=true. A verification/test is now mandatory before resolution."
+                    )
+                else:
+                    # A failed executable FIX did not change the system, so
+                    # mandatory post-fix verification would be misleading.
+                    # Keep the failed target blocked, but let the orchestrator
+                    # choose another verified target, another supported fix, a
+                    # new diagnostic, or escalation.
+                    failed_fixes.add(fix_key)
+                    post_fix_verification_required = False
+                    last_verification_success = False
+                    user_feedback.append(
+                        f"Tool result for FIX '{tool_name}': success=false. No system change is confirmed. Do not treat this as a completed fix; choose another evidence-based action, another verified target, or escalate."
+                    )
             else:
                 last_diagnostic_success = bool(result.success)
                 user_feedback.append(
@@ -699,9 +792,21 @@ class AgentService:
         allowed = set(definition.argument_schema)
         if any(key not in allowed for key in arguments):
             return False
-        # Values are deliberately string-only for the current Windows tools.
-        # Empty strings are rejected where a value was supplied.
-        return all(isinstance(value, str) and value.strip() for value in arguments.values())
+
+        # Most Windows capability arguments are evidence strings. A common
+        # JSON-model variation is returning a PID as a JSON number instead of
+        # a string (for example, 34888 rather than "34888"). Accept that
+        # safe representation for PID arguments because the executable runner
+        # already validates the PID and re-checks the live process before a fix.
+        for key, value in arguments.items():
+            if isinstance(value, str):
+                if not value.strip():
+                    return False
+                continue
+            if key == "pid" and isinstance(value, int) and not isinstance(value, bool) and value > 0:
+                continue
+            return False
+        return True
 
     @staticmethod
     def _feedback_explicitly_retries(user_feedback: list[str], tool_name: str) -> bool:
@@ -719,6 +824,8 @@ class AgentService:
         history: list[dict[str, Any]],
         allowed: set[str],
         user_feedback: list[str],
+        attempted_fixes: set[tuple[str, str]],
+        failed_fixes: set[tuple[str, str]],
         post_fix_verification_required: bool,
     ) -> str:
         tool_metadata = []
@@ -743,10 +850,15 @@ class AgentService:
         if len(feedback_text) > 5000:
             feedback_text = feedback_text[-5000:]
 
+        attempted_text = json.dumps(sorted(attempted_fixes), ensure_ascii=False)
+        failed_text = json.dumps(sorted(failed_fixes), ensure_ascii=False)
+
         return (
             "SESSION STATE\n"
             f"Selected KB: {kb_id}\n"
-            f"Post-fix verification required: {post_fix_verification_required}\n\n"
+            f"Post-fix verification required: {post_fix_verification_required}\n"
+            f"Attempted FIX targets: {attempted_text}\n"
+            f"FIX targets that failed to execute: {failed_text}\n\n"
             "SELECTED KNOWLEDGE BASE (AUTHORITATIVE):\n"
             f"{json.dumps(kb, ensure_ascii=False, indent=2)}\n\n"
             "EXACT EXECUTABLE CAPABILITIES EXPOSED FOR THIS KB:\n"

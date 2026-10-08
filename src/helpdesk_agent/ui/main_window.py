@@ -35,6 +35,7 @@ class ApprovalBridge:
 class AgentWorker(QThread):
     event_signal = Signal(object)
     approval_signal = Signal(object, str, str)
+    user_decision_signal = Signal(object, str, str)
     finished_signal = Signal()
 
     def __init__(self, service: AgentService, problem: str, backend: str):
@@ -46,7 +47,13 @@ class AgentWorker(QThread):
 
     def run(self):
         try:
-            self.service.run(self.problem, self.backend, self.event_signal.emit, self._request_approval)
+            self.service.run(
+                self.problem,
+                self.backend,
+                self.event_signal.emit,
+                self._request_approval,
+                self._request_user_decision,
+            )
         finally:
             self.finished_signal.emit()
 
@@ -61,6 +68,17 @@ class AgentWorker(QThread):
         self._approval = None
         return bridge.value
 
+    def _request_user_decision(self, action: str, message: str, reason: str) -> ApprovalResponse:
+        bridge = ApprovalBridge()
+        self._approval = bridge
+        self.user_decision_signal.emit(action, message, reason)
+        while not bridge.event.wait(0.10):
+            if self.isInterruptionRequested():
+                bridge.respond(ApprovalResponse("no", "Window closed; do not make a change."))
+                break
+        self._approval = None
+        return bridge.value
+
     def respond_to_approval(self, response: ApprovalResponse):
         if self._approval:
             self._approval.respond(response)
@@ -70,7 +88,13 @@ class DecisionDialog(QDialog):
     def __init__(self, parent, action: str, message: str, reason: str):
         super().__init__(parent)
         self.is_resolution_confirmation = action == "CONFIRM_RESOLUTION"
-        self.setWindowTitle("Problem Solved?") if self.is_resolution_confirmation else self.setWindowTitle("L1 Fix Decision")
+        self.is_user_decision = action == "ASK_USER"
+        if self.is_resolution_confirmation:
+            self.setWindowTitle("Problem Solved?")
+        elif self.is_user_decision:
+            self.setWindowTitle("L1 Agent Needs Your Input")
+        else:
+            self.setWindowTitle("L1 Fix Decision")
         self.setModal(True)
         self.setMinimumWidth(520)
         self.choice = ApprovalResponse("no", "")
@@ -79,6 +103,9 @@ class DecisionDialog(QDialog):
         if self.is_resolution_confirmation:
             title = QLabel("Is your problem solved?")
             body_text = f"{message}\n\nReason: {reason}\n\nPlease confirm whether the original problem is actually gone."
+        elif self.is_user_decision:
+            title = QLabel("I need your input")
+            body_text = f"{message}\n\nReason: {reason}\n\nYes = follow the suggested option. No = do not use it. Your idea = tell the agent what you want instead."
         else:
             title = QLabel(f"Proposed action: {action}")
             body_text = f"{message}\n\nReason: {reason}\n\nAllow this action to run?"
@@ -92,6 +119,8 @@ class DecisionDialog(QDialog):
         self.idea = QPlainTextEdit()
         if self.is_resolution_confirmation:
             self.idea.setPlaceholderText("Tell the L1 agent what is still wrong or what you want it to try next…")
+        elif self.is_user_decision:
+            self.idea.setPlaceholderText("For example: check Teams, use Firefox, or run the temp cleanup…")
         else:
             self.idea.setPlaceholderText("Tell the L1 agent what you want it to consider instead…")
         self.idea.setFixedHeight(75)
@@ -220,6 +249,7 @@ class MainWindow(QMainWindow):
         self.worker = AgentWorker(self.service, problem, self.backend.currentText())
         self.worker.event_signal.connect(self.on_event)
         self.worker.approval_signal.connect(self.on_approval)
+        self.worker.user_decision_signal.connect(self.on_user_decision)
         self.worker.finished_signal.connect(self.on_finished)
         self.worker.start()
         self.input.clear()
@@ -257,12 +287,22 @@ class MainWindow(QMainWindow):
         if self.worker:
             self.worker.respond_to_approval(dialog.choice)
 
+    @Slot(object, str, str)
+    def on_user_decision(self, action: str, message: str, reason: str):
+        dialog = DecisionDialog(self, action, message, reason)
+        dialog.exec()
+        if self.worker:
+            self.worker.respond_to_approval(dialog.choice)
+
     @Slot()
     def on_finished(self):
+        # Completing one request never closes the agent. The window remains alive
+        # until the user explicitly closes it, and a new request can be submitted.
         self.send.setEnabled(True)
         self.backend.setEnabled(True)
         self.worker = None
         self.input.setFocus()
+        self.problem_label.setText("Problem: waiting for request")
 
     def closeEvent(self, event):
         if self.worker and self.worker.isRunning():

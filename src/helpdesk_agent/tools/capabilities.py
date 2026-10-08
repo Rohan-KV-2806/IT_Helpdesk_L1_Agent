@@ -499,14 +499,47 @@ $p | Format-Table -AutoSize | Out-String
 @capability(
     "check_top_memory_processes",
     "DIAGNOSTIC",
-    "Identify current top memory-consuming processes with PIDs.",
+    "Identify current top memory-consuming user processes with PIDs. The agent and parent process are excluded.",
 )
 def check_top_memory_processes(_: dict[str, Any]) -> ToolResult:
-    script = r"""
+    agent_pid = os.getpid()
+    parent_pid = os.getppid()
+    script = f"""
+$exclude = @({agent_pid}, {parent_pid})
 Get-Process |
+    Where-Object {{ $exclude -notcontains $_.Id }} |
     Sort-Object WorkingSet64 -Descending |
-    Select-Object -First 12 ProcessName,Id,@{N='MemoryMB';E={[math]::Round($_.WorkingSet64/1MB,1)}},Responding |
+    Select-Object -First 20 ProcessName,Id,@{{N='MemoryMB';E={{[math]::Round($_.WorkingSet64/1MB,1)}}}},Responding,MainWindowTitle |
     Format-Table -AutoSize | Out-String
+"""
+    return _ps(script)
+
+
+@capability(
+    "check_named_process",
+    "DIAGNOSTIC",
+    "Find a running Windows process by a user-supplied application/process name, including common renamed or prefixed processes such as Microsoft Teams (for example ms-teams).",
+    argument_schema={"name": "Application or process name supplied by the user, e.g. Teams"},
+)
+def check_named_process(arguments: dict[str, Any]) -> ToolResult:
+    name = str(arguments.get("name", "")).strip()
+    if not name or any(c in name for c in "'\"\r\n;|`$&"):
+        return ToolResult(False, "A safe process name is required.")
+    agent_pid = os.getpid()
+    parent_pid = os.getppid()
+    escaped = _ps_quote(name)
+    script = f"""
+$needle = {escaped}
+$exclude = @({agent_pid}, {parent_pid})
+$matches = Get-Process | Where-Object {{
+    $exclude -notcontains $_.Id -and ($_.ProcessName -like ("*" + $needle + "*") -or $_.MainWindowTitle -like ("*" + $needle + "*"))
+}} |
+    Select-Object ProcessName,Id,@{{N='MemoryMB';E={{[math]::Round($_.WorkingSet64/1MB,1)}}}},Responding,MainWindowTitle
+if (-not $matches) {{
+    Write-Output ("No running process matched: " + $needle)
+}} else {{
+    $matches | Sort-Object MemoryMB -Descending | Format-Table -AutoSize | Out-String
+}}
 """
     return _ps(script)
 
@@ -514,23 +547,47 @@ Get-Process |
 @capability(
     "close_high_resource_process",
     "FIX",
-    "Close one verified user-space process identified by a diagnostic PID.",
+    "Close one exact verified user-space process identified by diagnostic PID and process name.",
     requires_approval=True,
-    argument_schema={"pid": "PID from CPU/memory process diagnostics"},
+    argument_schema={"pid": "PID from CPU/memory process diagnostics", "process_name": "Exact process name from the latest diagnostic result"},
 )
 def close_high_resource_process(arguments: dict[str, Any]) -> ToolResult:
     pid = str(arguments.get("pid", "")).strip()
+    process_name = str(arguments.get("process_name", "")).strip()
     if not pid.isdigit() or int(pid) <= 0:
         return ToolResult(False, "A valid PID from CPU/memory diagnostics is required.")
-    protected_pids = {os.getpid(), os.getppid()}
+    if not process_name or any(c in process_name for c in "'\"\r\n;|`$&"):
+        return ToolResult(False, "A valid process_name from diagnostics is required.")
+
+    # These are the Python agent process and the process that launched it.
+    # They must never become valid close targets, even if the LLM supplies a
+    # PID that happens to match one of them.
+    agent_pid = os.getpid()
+    parent_pid = os.getppid()
+    protected_pids = {agent_pid, parent_pid}
     if int(pid) in protected_pids:
         return ToolResult(False, "The agent process or its parent cannot be terminated.")
+
+    expected_name = _ps_quote(process_name)
     script = f"""
 $p = Get-Process -Id {int(pid)} -ErrorAction Stop
-$protected = @('System','Idle','Registry','smss','csrss','wininit','services','lsass','winlogon','dwm','svchost')
-if ($protected -contains $p.ProcessName) {{ throw 'Protected system process cannot be closed.' }}
-Stop-Process -Id {int(pid)} -Force -ErrorAction Stop
-Write-Output ("Process terminated: " + $p.ProcessName + " (PID " + $p.Id + ")")
+$protected = @('System','Idle','Registry','smss','csrss','wininit','services','lsass','winlogon','dwm','svchost','MsMpEng','MsSense','Memory Compression')
+if ($protected -contains $p.ProcessName) {{ throw 'Protected system/security process cannot be closed.' }}
+if ($p.Id -eq {agent_pid} -or $p.Id -eq {parent_pid}) {{ throw 'The helpdesk agent process or its parent cannot be closed.' }}
+if ($p.ProcessName -ne {expected_name}) {{ throw ('PID ' + $p.Id + ' no longer belongs to expected process ' + {expected_name} + '.') }}
+if ($p.MainWindowHandle -eq 0) {{ throw 'The selected process has no visible application window and cannot be safely closed as a user app.' }}
+
+# Ask the application to close gracefully first. Only force-kill the same
+# verified PID if the window remains after the grace period.
+$closed = $p.CloseMainWindow()
+Start-Sleep -Seconds 2
+$p.Refresh()
+if (-not $p.HasExited) {{
+    $p.Kill()
+    $p.WaitForExit(5000) | Out-Null
+}}
+if (-not $p.HasExited) {{ throw 'The verified process did not exit after the close request.' }}
+Write-Output ("Process closed: " + $p.ProcessName + " (PID " + $p.Id + ")")
 """
     return _ps(script, 20)
 

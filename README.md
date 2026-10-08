@@ -147,3 +147,26 @@ The tests cover KB discovery/validation, the classifier's legacy-JSON compatibil
 - GENERAL_CHAT never creates tickets or reports and receives a fixed L1 helpdesk response.
 - A technical resolution is never finalized until the user confirms the original problem is actually solved.
 - If the user selects No or Your idea in the resolution decision window, the instruction is returned to the LLM orchestrator; classification is not repeated.
+
+## Decision/input responsiveness and process targeting
+
+- `ask_user` is now an interactive decision checkpoint instead of ending the troubleshooting run. The same GUI decision window opens immediately and the response returns directly to the current orchestrator session.
+- `Your idea` remains in the current troubleshooting context; it is never reclassified as a new request.
+- The CPU/memory KB now exposes `check_named_process`, so a user-mentioned application such as Teams can be verified even when it is not in the top-memory list.
+- The memory process diagnostic excludes the agent and parent process and reports more candidates, including window titles.
+- Process-closing fixes require both the exact PID and exact process name from diagnostic evidence. The runtime re-checks the PID before closing it and protects the agent, its parent, and Windows/security processes.
+- The orchestrator is explicitly forbidden from silently substituting another user application when the user names a specific process.
+- Finishing a request never closes the application window. The L1 Agent remains open and ready for another request until the user explicitly closes it.
+
+## Latest process/memory troubleshooting hardening
+
+This build fixes the process-close execution path and the recovery behavior around failed or declined fixes. In particular:
+
+- `close_high_resource_process` now defines and protects the agent PID and parent PID before building the PowerShell command.
+- A failed FIX is recorded as a failed execution, not as a completed state change, so the loop does not incorrectly force post-fix verification.
+- The exact FIX target is tracked by capability + arguments. A different verified PID/process name may therefore reuse the same close capability.
+- Repair logic no longer treats a legitimate diagnostic, user question, or escalation after a repeated/declined FIX as an internal protocol failure.
+- The memory KB explicitly tells the orchestrator to verify a newly named application and never silently substitute another app.
+- Process closing re-checks the live PID, process name, visibility, and protected-process rules immediately before closing.
+
+PowerShell's documented `Get-Process -Id` and `Get-Process -Name` behavior is used for the runtime process checks; PID-based targeting is revalidated immediately before the state-changing action.
