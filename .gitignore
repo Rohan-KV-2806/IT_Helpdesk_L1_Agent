@@ -1,9 +1,8 @@
-.venv/
-LocalLLMs/
-ClassifierModels/
+.env
 __pycache__/
 *.pyc
-.env
-tickets/
 reports/
+tickets/
+tests/
+test/
 Past Versions/

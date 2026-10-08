@@ -1,6 +1,5 @@
-pip install llama-cpp-python
-pip install -U "huggingface_hub[cli]"
-pip install pandas
-pip install scikit-learn
-pip install joblib
-pip install openai python-dotenv
+PySide6>=6.8
+python-dotenv>=1.0
+openai>=1.0
+llama-cpp-python>=0.3.0
+pytest>=8.0

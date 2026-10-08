@@ -1,375 +1,772 @@
 from __future__ import annotations
 
-import re
+import json
 from dataclasses import dataclass
-from typing import Callable
+from typing import Any, Callable, Literal
 
-from ..config import KB_ROOT, MAX_AGENT_STEPS, REPORTS_ROOT, SYSTEM_PROMPT
+from ..config import (
+    CLASSIFIER_SYSTEM_PROMPT,
+    KB_ROOT,
+    MAX_AGENT_STEPS,
+    MAX_PROTOCOL_REPAIRS,
+    ORCHESTRATOR_SYSTEM_PROMPT,
+    PROTOCOL_REPAIR_PROMPT,
+    REPORTS_ROOT,
+)
 from ..knowledge.store import build_kb_catalog, discover_kbs, load_kb
-from ..llm.provider import ModelProvider, parse_json_object
+from ..llm.provider import ModelProvider, ModelProviderError, parse_json_object
 from ..ticketing.service import create_ticket, save_report
-from ..tools.actions import ToolResult, resolve_tool
+from ..tools.capabilities import ToolDefinition, ToolResult, get_capabilities
 
 
-@dataclass
+@dataclass(frozen=True)
+class ApprovalResponse:
+    choice: Literal["yes", "no", "idea"]
+    instruction: str = ""
+
+
+@dataclass(frozen=True)
 class AgentEvent:
     kind: str
     message: str
-    payload: dict | None = None
+    payload: dict[str, Any] | None = None
+
+
+class UnsupportedRequest(Exception):
+    pass
 
 
 class AgentService:
-    def __init__(self, provider: ModelProvider | None = None) -> None:
+    """KB-guided L1 agent with an LLM-controlled tool loop.
+
+    Python is deliberately responsible for safety, validation, permissions,
+    and execution. The LLM decides the next troubleshooting action.
+    """
+
+    def __init__(self, provider: ModelProvider | None = None):
         self.provider = provider or ModelProvider()
+        self.capabilities = get_capabilities()
 
     def run(
         self,
         problem: str,
         backend: str,
         on_event: Callable[[AgentEvent], None],
-        request_approval: Callable[[str, str, str], bool],
+        request_approval: Callable[[str, str, str], ApprovalResponse],
     ) -> None:
-        history: list[dict] = []
+        problem = problem.strip()
+        if not problem:
+            on_event(AgentEvent("internal_error", "The request was empty."))
+            return
 
         try:
-            kb_filename, classify_result = self._classify(problem, backend)
+            kb_id = self._classify(problem, backend)
+            on_event(AgentEvent("classification", f"Knowledge base: {kb_id}", {"category": kb_id, "backend": backend}))
+            kb = load_kb(kb_id)
+        except UnsupportedRequest as exc:
+            self._handle_unsupported(problem, str(exc), on_event)
+            return
+        except Exception as exc:
+            on_event(AgentEvent("internal_error", f"Agent startup failed: {exc}"))
+            return
+
+        try:
+            allowed = self._kb_capabilities(kb)
+        except Exception as exc:
+            on_event(AgentEvent("internal_error", f"Invalid selected knowledge base: {exc}"))
+            return
+
+        missing = sorted(name for name in allowed if name not in self.capabilities)
+        if missing:
             on_event(
                 AgentEvent(
-                    "classification",
-                    f"Knowledge base: {kb_filename}",
-                    {"category": kb_filename, "backend": classify_result.backend},
+                    "internal_error",
+                    "The selected knowledge base references unavailable executable capabilities: " + ", ".join(missing),
                 )
             )
-        except UnsupportedRequest as exc:
-            message = self._unsupported_message()
-            report = {
-                "status": "TICKET_REQUIRED",
-                "problem_verified": False,
-                "category": None,
-                "summary": problem,
-                "reason": str(exc),
-            }
-            ticket_id, path = create_ticket(problem, None, history, str(exc))
-            report["ticket_id"] = ticket_id
-            save_report(report, REPORTS_ROOT)
-            on_event(AgentEvent("unsupported", message, {"ticket_id": ticket_id, "path": str(path)}))
-            return
-        except Exception as exc:
-            on_event(AgentEvent("internal_error", f"Agent classification failed: {exc}"))
             return
 
-        try:
-            kb = load_kb(kb_filename)
-        except Exception as exc:
-            on_event(AgentEvent("internal_error", str(exc)))
-            return
-
-        # The KB defines the executable action names and whether each one is a
-        # diagnostic or a fix. Python does not maintain a category-specific map.
-        kb_tools = self._parse_kb_tools(kb)
-        if not kb_tools:
-            on_event(AgentEvent("internal_error", f"The selected KB '{kb_filename}' does not define any executable diagnostic or fix tools."))
-            return
-
-        completed_tools: list[str] = []
+        # Session state is deliberately explicit. The LLM remains the
+        # orchestrator; these values are hard safety/integrity guards.
+        history: list[dict[str, Any]] = []
+        user_feedback: list[str] = []
+        attempted_fixes: set[tuple[str, str]] = set()
+        declined_fixes: set[tuple[str, str]] = set()
+        repeated_tools: dict[tuple[str, str], int] = {}
+        fixes_executed: list[str] = []
+        post_fix_verification_required = False
+        last_verification_success = True
+        last_diagnostic_success = False
 
         for step in range(1, MAX_AGENT_STEPS + 1):
-            on_event(AgentEvent("status", f"Step {step}: deciding next action…"))
+            on_event(AgentEvent("status", f"Step {step}: LLM deciding next action…"))
+            context = self._build_orchestrator_context(
+                kb_id=kb_id,
+                kb=kb,
+                problem=problem,
+                history=history,
+                allowed=allowed,
+                user_feedback=user_feedback,
+                post_fix_verification_required=post_fix_verification_required,
+            )
 
-            context = self._build_context(kb_filename, kb, problem, history, kb_tools)
             try:
-                result = self.provider.complete(SYSTEM_PROMPT, context, backend)
-                try:
-                    data = parse_json_object(result.content)
-                except Exception:
-                    retry_context = context + (
-                        "\n\nFORMAT CORRECTION: Your previous response was not valid JSON. "
-                        "Return exactly one complete JSON object matching the troubleshooting output contract. "
-                        "Do not include prose, markdown, or reasoning outside the JSON object."
-                    )
-                    retry_result = self.provider.complete(SYSTEM_PROMPT, retry_context, backend)
-                    data = parse_json_object(retry_result.content)
-                    on_event(AgentEvent("model", f"{retry_result.backend} corrected decision received.", {"raw": retry_result.content}))
-                else:
-                    on_event(AgentEvent("model", f"{result.backend} decision received.", {"raw": result.content}))
+                decision = self._get_decision_with_repair(context, backend)
             except Exception as exc:
                 on_event(AgentEvent("internal_error", f"Agent decision failed: {exc}"))
                 return
 
-            status = str(data.get("status", "")).strip().upper()
-            action_type = str(data.get("action_type", "")).strip().upper()
-            action = str(data.get("action", "")).strip()
-            message = str(data.get("message", "")).strip()
-            reason = str(data.get("reason", "")).strip()
-            arguments = data.get("arguments", {})
-
-            if not isinstance(arguments, dict):
-                on_event(AgentEvent("internal_error", "Model returned malformed tool arguments."))
-                return
-
-            if status == "UNSUPPORTED":
-                on_event(AgentEvent("internal_error", "Model returned UNSUPPORTED after a supported KB was selected."))
-                return
-
-            if action_type == "ASK_USER":
-                if action:
-                    on_event(AgentEvent("internal_error", "ASK_USER must not contain a tool action."))
-                    return
-                retry_context = context + (
-                    "\n\nPROTOCOL CORRECTION: ASK_USER is only for information or a user/physical test "
-                    "explicitly required by the knowledge base. It must never be used to request approval for a FIX. "
-                    "The application handles FIX approval through its Yes/No dialog. Reconsider the next action "
-                    "and return exactly one JSON decision."
-                )
-                try:
-                    retry_result = self.provider.complete(SYSTEM_PROMPT, retry_context, backend)
-                    data = parse_json_object(retry_result.content)
-                    on_event(AgentEvent("model", f"{retry_result.backend} corrected decision received.", {"raw": retry_result.content}))
-                    status = str(data.get("status", "")).strip().upper()
-                    action_type = str(data.get("action_type", "")).strip().upper()
-                    action = str(data.get("action", "")).strip()
-                    message = str(data.get("message", "")).strip()
-                    reason = str(data.get("reason", "")).strip()
-                    arguments = data.get("arguments", {})
-                    if not isinstance(arguments, dict):
-                        raise ValueError("Corrected decision returned malformed tool arguments.")
-                except Exception as exc:
-                    on_event(AgentEvent("internal_error", f"Agent decision failed after ASK_USER correction: {exc}"))
-                    return
-                if action_type == "ASK_USER":
-                    on_event(AgentEvent("internal_error", "Model continued to use ASK_USER where the application protocol requires a direct FIX action for approval."))
-                    return
-
-            if action_type == "RESOLVED":
-                if action:
-                    on_event(AgentEvent("internal_error", "RESOLVED must not contain a tool action."))
-                    return
-                problem_verified = data.get("problem_verified")
-                verification_successful = data.get("verification_successful")
-                if not isinstance(problem_verified, bool) or not isinstance(verification_successful, bool):
-                    on_event(AgentEvent("internal_error", "RESOLVED decision must include boolean problem_verified and verification_successful fields."))
-                    return
-                report = {
-                    "status": "RESOLVED",
-                    "problem_verified": problem_verified,
-                    "category": kb_filename,
-                    "summary": problem,
-                    "diagnosis": reason,
-                    "actions_taken": history,
-                    "verification_successful": verification_successful,
-                    "message": message or "The issue appears to be resolved.",
-                }
-                path = save_report(report, REPORTS_ROOT)
-                on_event(AgentEvent("resolved", report["message"], {"report_path": str(path), "report": report}))
-                return
-
-            if action_type == "ESCALATE":
-                if action:
-                    on_event(AgentEvent("internal_error", "ESCALATE must not contain a tool action."))
-                    return
-                problem_verified = data.get("problem_verified")
-                verification_successful = data.get("verification_successful")
-                if not isinstance(problem_verified, bool) or not isinstance(verification_successful, bool):
-                    on_event(AgentEvent("internal_error", "ESCALATE decision must include boolean problem_verified and verification_successful fields."))
-                    return
-                ticket_reason = reason or "The knowledge base requires escalation."
-                ticket_id, path = create_ticket(problem, kb_filename, history, ticket_reason)
-                report = {
-                    "status": "TICKET_REQUIRED",
-                    "problem_verified": problem_verified,
-                    "category": kb_filename,
-                    "summary": problem,
-                    "diagnosis": reason,
-                    "actions_taken": history,
-                    "verification_successful": verification_successful,
-                    "ticket_required": True,
-                    "ticket_id": ticket_id,
-                    "ticket_reason": ticket_reason,
-                }
-                save_report(report, REPORTS_ROOT)
-                on_event(AgentEvent("ticket", f"Ticket created: {ticket_id}", {"ticket_id": ticket_id, "path": str(path), "report": report}))
-                return
-
-            if status != "ACTION_REQUIRED":
-                on_event(AgentEvent("internal_error", f"Unsupported model status: {status}"))
-                return
-
-            if action_type not in {"DIAGNOSTIC", "FIX"}:
-                on_event(AgentEvent("internal_error", f"Unsupported action type: {action_type}"))
-                return
-
-            # Action permission comes from the selected KB, not from Python.
-            if action not in kb_tools:
-                on_event(AgentEvent("internal_error", f"Model selected a tool not documented by the selected KB: {action}"))
-                return
-
-            kb_action_type = kb_tools[action]
-            if kb_action_type != action_type:
-                on_event(AgentEvent("internal_error", f"Action type mismatch for KB tool '{action}'."))
-                return
-
-            # Resolve the exact tool name to a Python function. There is no
-            # central tool registry; the function name itself is the binding.
-            runner = resolve_tool(action)
-            if runner is None:
-                on_event(AgentEvent("internal_error", f"The selected KB requires tool '{action}', but no Python implementation exists for that exact tool name."))
-                return
-
-            if kb_action_type == "DIAGNOSTIC" and action in completed_tools:
-                previous_tool = history[-1]["tool"] if history else None
-                previous_type = kb_tools.get(previous_tool) if previous_tool else None
-                if previous_type != "FIX":
-                    on_event(AgentEvent("internal_error", f"The diagnostic '{action}' was already completed and is not a valid repeated step."))
-                    return
-
-            if kb_action_type == "FIX" and not self._has_successful_diagnostic(history, kb_tools):
-                on_event(AgentEvent("internal_error", "A state-changing tool was selected before a successful diagnostic."))
-                return
-
-            if action in completed_tools and kb_action_type == "FIX":
-                on_event(AgentEvent("internal_error", f"The same fix was already attempted: {action}"))
-                return
-
-            # Every KB-defined FIX is treated as state-changing. The GUI owns
-            # the approval interaction and returns only True/False here.
-            if kb_action_type == "FIX":
-                approved = request_approval(action, message or f"Run KB-defined fix: {action}", reason)
-                if not approved:
-                    on_event(AgentEvent("status", "Fix declined. No ticket was created."))
-                    return
-
-            on_event(AgentEvent("tool", f"Running {action}…", {"tool": action, "arguments": arguments}))
             try:
-                tool_result: ToolResult = runner(arguments)
-            except Exception as exc:
-                on_event(AgentEvent("internal_error", f"Tool '{action}' failed inside the application: {exc}"))
+                normalized = self._normalize_decision(decision, kb_id)
+            except ValueError as exc:
+                # Give the LLM a bounded opportunity to repair a structurally
+                # invalid decision without executing anything unsafe.
+                repaired = self._repair_decision(context, backend, str(exc))
+                if repaired is None:
+                    on_event(AgentEvent("internal_error", f"LLM returned an invalid decision: {exc}"))
+                    return
+                try:
+                    normalized = self._normalize_decision(repaired, kb_id)
+                except ValueError as second_exc:
+                    on_event(AgentEvent("internal_error", f"LLM returned an invalid decision after repair: {second_exc}"))
+                    return
+
+            on_event(AgentEvent("model", "LLM decision received.", {"decision": normalized}))
+            decision_type = normalized["decision"]
+
+            if decision_type == "resolved":
+                # The LLM cannot close a session before it has at least one
+                # successful diagnostic execution.
+                if not any(entry["category"] == "DIAGNOSTIC" for entry in history) or not last_diagnostic_success:
+                    repaired = self._repair_decision(
+                        context,
+                        backend,
+                        "A RESOLVED decision is not allowed yet. At least one diagnostic capability must execute successfully first. Select a KB-defined TEST/DIAGNOSIS capability.",
+                    )
+                    if repaired is None:
+                        on_event(AgentEvent("internal_error", "LLM attempted to resolve before usable diagnostic evidence."))
+                        return
+                    try:
+                        normalized = self._normalize_decision(repaired, kb_id)
+                    except ValueError as exc:
+                        on_event(AgentEvent("internal_error", f"LLM could not repair the missing diagnostic step: {exc}"))
+                        return
+                    if normalized["decision"] != "tool_call":
+                        on_event(AgentEvent("internal_error", "LLM repair did not select a diagnostic capability."))
+                        return
+                    decision_type = "tool_call"
+                else:
+                    # After every state-changing action, the next useful
+                    # evidence must come from a KB-defined verification tool.
+                    if fixes_executed and (post_fix_verification_required or not last_verification_success):
+                        repaired = self._repair_decision(
+                            context,
+                            backend,
+                            "A FIX was executed but the latest required verification is missing or failed. Select a KB-defined Verification diagnostic before resolving.",
+                        )
+                        if repaired is None:
+                            on_event(AgentEvent("internal_error", "LLM attempted to declare success before successful verification."))
+                            return
+                        try:
+                            normalized = self._normalize_decision(repaired, kb_id)
+                        except ValueError as exc:
+                            on_event(AgentEvent("internal_error", f"LLM could not repair the missing verification step: {exc}"))
+                            return
+                        if normalized["decision"] != "tool_call":
+                            on_event(AgentEvent("internal_error", "LLM repair did not select the required verification capability."))
+                            return
+                        decision_type = "tool_call"
+                    else:
+                        report = self._make_resolved_report(
+                            problem=problem,
+                            kb_id=kb_id,
+                            history=history,
+                            decision=normalized,
+                        )
+                        save_report(report, REPORTS_ROOT)
+                        on_event(AgentEvent("resolved", normalized["message"], {"report": report}))
+                        return
+
+                # A repair converted a premature RESOLVED decision into a
+                # tool call. Continue through the normal safety/execution path.
+
+            if decision_type == "escalate":
+                self._handle_escalation(problem, kb_id, history, normalized, on_event)
                 return
 
-            completed_tools.append(action)
+            if decision_type == "ask_user":
+                on_event(AgentEvent("ask", normalized["message"], {"reason": normalized["reason"]}))
+                return
+
+            tool_name = normalized["tool"]
+            arguments = normalized["arguments"]
+            phase = normalized["phase"]
+            definition = self.capabilities.get(tool_name)
+            if definition is None:
+                on_event(AgentEvent("internal_error", f"LLM selected unavailable capability '{tool_name}'."))
+                return
+
+            if tool_name not in allowed:
+                repaired = self._repair_decision(
+                    context,
+                    backend,
+                    f"Capability '{tool_name}' is not documented by the selected KB. Choose only a capability from the supplied KB tool list.",
+                )
+                if repaired is None:
+                    on_event(AgentEvent("internal_error", f"LLM selected a capability not documented by the selected KB: {tool_name}"))
+                    return
+                normalized = self._normalize_decision(repaired, kb_id)
+                if normalized["decision"] != "tool_call":
+                    # Process a valid non-tool repaired decision on the next
+                    # loop iteration so every turn still has one clear action.
+                    if normalized["decision"] == "resolved":
+                        on_event(AgentEvent("internal_error", "LLM repair attempted to resolve without executing the required tool."))
+                    elif normalized["decision"] == "escalate":
+                        self._handle_escalation(problem, kb_id, history, normalized, on_event)
+                    else:
+                        on_event(AgentEvent("ask", normalized.get("message", "More user information is required.")))
+                    return
+                tool_name = normalized["tool"]
+                arguments = normalized["arguments"]
+                phase = normalized["phase"]
+                definition = self.capabilities.get(tool_name)
+                if definition is None or tool_name not in allowed:
+                    on_event(AgentEvent("internal_error", "LLM could not select a valid KB capability after protocol repair."))
+                    return
+
+            if definition.category != "DIAGNOSTIC" and definition.category != "FIX":
+                on_event(AgentEvent("internal_error", f"Capability '{tool_name}' has an unsupported execution category."))
+                return
+
+            if not self._validate_arguments(arguments, definition):
+                reason = f"Arguments for '{tool_name}' do not match the declared capability schema."
+                repaired = self._repair_decision(context, backend, reason)
+                if repaired is None:
+                    on_event(AgentEvent("internal_error", reason))
+                    return
+                normalized = self._normalize_decision(repaired, kb_id)
+                if normalized["decision"] != "tool_call":
+                    on_event(AgentEvent("internal_error", "LLM repair did not return the required capability call."))
+                    return
+                tool_name = normalized["tool"]
+                arguments = normalized["arguments"]
+                phase = normalized["phase"]
+                definition = self.capabilities.get(tool_name)
+                if definition is None or tool_name not in allowed or not self._validate_arguments(arguments, definition):
+                    on_event(AgentEvent("internal_error", "LLM returned invalid capability arguments after protocol repair."))
+                    return
+
+            fingerprint = (tool_name, json.dumps(arguments, sort_keys=True, ensure_ascii=False))
+            repeated_tools[fingerprint] = repeated_tools.get(fingerprint, 0) + 1
+
+            verification_tools_for_repeat_guard = set(self._tool_group(kb, "Verification"))
+            repeat_limit = 3 if post_fix_verification_required and tool_name in verification_tools_for_repeat_guard else 2
+            if repeated_tools[fingerprint] > repeat_limit:
+                on_event(
+                    AgentEvent(
+                        "internal_error",
+                        f"LLM entered a repeated tool loop with '{tool_name}'. No ticket was created because this is an agent-loop failure.",
+                    )
+                )
+                return
+
+            if definition.category == "DIAGNOSTIC":
+                if post_fix_verification_required:
+                    verification_tools = set(self._tool_group(kb, "Verification"))
+                    if tool_name not in verification_tools:
+                        repaired = self._repair_decision(
+                            context,
+                            backend,
+                            f"The previous action was a FIX. The next action must be a verification/test capability from this KB: {sorted(verification_tools)}.",
+                        )
+                        if repaired is None:
+                            on_event(AgentEvent("internal_error", "LLM could not select the mandatory post-fix verification."))
+                            return
+                        normalized = self._normalize_decision(repaired, kb_id)
+                        if normalized["decision"] != "tool_call" or normalized["tool"] not in verification_tools:
+                            on_event(AgentEvent("internal_error", "LLM repeatedly skipped mandatory post-fix verification."))
+                            return
+                        tool_name = normalized["tool"]
+                        arguments = normalized["arguments"]
+                        phase = normalized["phase"]
+                        definition = self.capabilities[tool_name]
+
+            if definition.category == "FIX":
+                diagnostic_history = [entry for entry in history if entry["category"] == "DIAGNOSTIC"]
+                if not diagnostic_history or not last_diagnostic_success:
+                    repaired = self._repair_decision(
+                        context,
+                        backend,
+                        "A FIX cannot run yet. At least one diagnostic tool must execute first and provide evidence.",
+                    )
+                    if repaired is None:
+                        on_event(AgentEvent("internal_error", "LLM attempted a FIX before diagnostics."))
+                        return
+                    normalized = self._normalize_decision(repaired, kb_id)
+                    if normalized["decision"] != "tool_call":
+                        on_event(AgentEvent("internal_error", "LLM repair did not select a diagnostic."))
+                        return
+                    tool_name = normalized["tool"]
+                    arguments = normalized["arguments"]
+                    phase = normalized["phase"]
+                    definition = self.capabilities.get(tool_name)
+                    if definition is None or definition.category != "DIAGNOSTIC" or tool_name not in allowed:
+                        on_event(AgentEvent("internal_error", "LLM returned a non-diagnostic after FIX-order repair."))
+                        return
+
+                fix_key = (tool_name, json.dumps(arguments, sort_keys=True, ensure_ascii=False))
+                if fix_key in declined_fixes and not self._feedback_explicitly_retries(user_feedback, tool_name):
+                    repaired = self._repair_decision(
+                        context,
+                        backend,
+                        f"The user has already declined '{tool_name}'. Do not propose it again unless the user's latest instruction explicitly requests retrying it.",
+                    )
+                    if repaired is None:
+                        on_event(AgentEvent("internal_error", "LLM repeatedly proposed a declined fix."))
+                        return
+                    normalized = self._normalize_decision(repaired, kb_id)
+                    if normalized["decision"] != "tool_call" or normalized["tool"] == tool_name:
+                        on_event(AgentEvent("internal_error", "LLM did not move away from a declined fix."))
+                        return
+                    tool_name = normalized["tool"]
+                    arguments = normalized["arguments"]
+                    phase = normalized["phase"]
+                    definition = self.capabilities[tool_name]
+                    fix_key = (tool_name, json.dumps(arguments, sort_keys=True, ensure_ascii=False))
+
+                if fix_key in attempted_fixes and not self._feedback_explicitly_retries(user_feedback, tool_name):
+                    repaired = self._repair_decision(
+                        context,
+                        backend,
+                        f"The same FIX '{tool_name}' with the same arguments was already executed. Do not repeat it unless the user explicitly requested a retry; choose another supported action or escalate.",
+                    )
+                    if repaired is None:
+                        on_event(AgentEvent("internal_error", "LLM entered a repeated-fix loop."))
+                        return
+                    normalized = self._normalize_decision(repaired, kb_id)
+                    if normalized["decision"] != "tool_call" or normalized["tool"] == tool_name:
+                        on_event(AgentEvent("internal_error", "LLM did not move away from the repeated fix."))
+                        return
+                    tool_name = normalized["tool"]
+                    arguments = normalized["arguments"]
+                    phase = normalized["phase"]
+                    definition = self.capabilities[tool_name]
+                    if definition.category != "FIX":
+                        on_event(AgentEvent("internal_error", "LLM changed to a non-fix while repairing a repeated FIX decision."))
+                        return
+                    fix_key = (tool_name, json.dumps(arguments, sort_keys=True, ensure_ascii=False))
+
+                if not definition.requires_approval:
+                    on_event(AgentEvent("internal_error", f"State-changing capability '{tool_name}' is not approval-gated."))
+                    return
+
+                dialog_reason = normalized.get("reason") or definition.description
+                dialog_message = normalized.get("message") or definition.description
+                approval = request_approval(tool_name, dialog_message, dialog_reason)
+
+                if approval.choice == "no":
+                    declined_fixes.add(fix_key)
+                    user_feedback.append(
+                        f"The user declined the proposed fix '{tool_name}'. Do not execute it. Reconsider the same KB and evidence."
+                    )
+                    on_event(AgentEvent("status", "Fix declined. The LLM will reconsider the evidence and remaining KB actions…"))
+                    continue
+
+                if approval.choice == "idea":
+                    instruction = approval.instruction.strip()
+                    if not instruction:
+                        user_feedback.append("The user chose Your idea but supplied no text. Continue without changing the system.")
+                    else:
+                        user_feedback.append(f"USER DECISION INSTRUCTION: {instruction}")
+                    on_event(AgentEvent("status", "Your idea was sent to the LLM for analysis. No system change was made."))
+                    continue
+
+                attempted_fixes.add(fix_key)
+                fixes_executed.append(tool_name)
+
+            on_event(
+                AgentEvent(
+                    "tool",
+                    f"Running {tool_name}…",
+                    {"tool": tool_name, "arguments": arguments, "phase": phase},
+                )
+            )
+
+            try:
+                result: ToolResult = definition.runner(arguments)
+            except Exception as exc:
+                result = ToolResult(False, f"Executable capability '{tool_name}' raised an unexpected error: {exc}")
+
+            output = (result.output or "(no output)").strip()
+            if len(output) > 6000:
+                output = output[:6000] + "\n[tool output truncated by agent runtime]"
+
             history.append(
                 {
-                    "tool": action,
-                    "success": tool_result.success,
+                    "step": step,
+                    "tool": tool_name,
+                    "category": definition.category,
+                    "phase": phase,
+                    "success": bool(result.success),
                     "arguments": arguments,
-                    "output": tool_result.output[:6000],
+                    "output": output,
                 }
             )
-            on_event(AgentEvent("tool_result", tool_result.output or "(no output)", {"tool": action, "success": tool_result.success}))
+            on_event(
+                AgentEvent(
+                    "tool_result",
+                    output,
+                    {"tool": tool_name, "success": result.success, "phase": phase},
+                )
+            )
 
-        on_event(AgentEvent("internal_error", f"The agent reached the maximum of {MAX_AGENT_STEPS} reasoning steps without a final KB decision. No ticket was created because this is an internal agent failure."))
+            if definition.category == "FIX":
+                post_fix_verification_required = True
+                last_verification_success = False
+                user_feedback.append(
+                    f"Tool result for FIX '{tool_name}': success={result.success}. A verification/test is now mandatory before resolution."
+                )
+            else:
+                last_diagnostic_success = bool(result.success)
+                user_feedback.append(
+                    f"Tool result for DIAGNOSTIC '{tool_name}': success={result.success}. Interpret the actual output; tool success only means the diagnostic ran."
+                )
+                if post_fix_verification_required and tool_name in set(self._tool_group(kb, "Verification")):
+                    post_fix_verification_required = False
+                    last_verification_success = bool(result.success)
 
-    def _classify(self, problem: str, backend: str):
+        on_event(
+            AgentEvent(
+                "internal_error",
+                f"The LLM agent loop reached the maximum of {MAX_AGENT_STEPS} steps. No ticket was created because this is an internal agent-loop limit.",
+            )
+        )
+
+    def _classify(self, problem: str, backend: str) -> str:
         candidates = discover_kbs()
         if not candidates:
-            raise RuntimeError(f"No Markdown knowledge-base files were found in {KB_ROOT}")
+            raise RuntimeError(f"No Python knowledge bases were found in {KB_ROOT}")
 
-        prompt = f"""CLASSIFY THIS USER REQUEST.
+        prompt = (
+            "AVAILABLE KNOWLEDGE BASES:\n"
+            f"{build_kb_catalog()}\n\n"
+            "USER REQUEST:\n"
+            f"{problem}\n\n"
+            "RETURN ONLY ONE EXACT KB ID OR UNSUPPORTED."
+        )
+        result = self.provider.complete(CLASSIFIER_SYSTEM_PROMPT, prompt, backend, json_mode=False)
+        kb_id = self._extract_kb_id(result.content, candidates)
+        if kb_id:
+            return kb_id
 
-Return EXACTLY ONE of the candidate filenames below, or UNSUPPORTED.
+        # One cheap protocol retry handles models that accidentally emit the
+        # troubleshooting JSON envelope during classification.
+        repair_prompt = (
+            "CLASSIFICATION FORMAT ERROR.\n"
+            f"The candidates are: {', '.join(candidates)}\n"
+            f"The previous model response was:\n{result.content[:1200]}\n\n"
+            "Return ONLY the exact KB ID or UNSUPPORTED."
+        )
+        repaired = self.provider.complete(CLASSIFIER_SYSTEM_PROMPT, repair_prompt, backend, json_mode=False)
+        kb_id = self._extract_kb_id(repaired.content, candidates)
+        if kb_id:
+            return kb_id
 
-CANDIDATE KNOWLEDGE-BASE FILES:
-{build_kb_catalog()}
-
-USER REQUEST:
-{problem}
-"""
-        result = self.provider.complete(SYSTEM_PROMPT, prompt, backend, json_mode=False)
-        raw = (result.content or "").strip()
-        normalized = self._normalize_classifier_output(raw)
-
-        if normalized in candidates:
-            return normalized, result
-        if normalized == "UNSUPPORTED":
-            raise UnsupportedRequest("The user's request does not match any discovered knowledge-base file.")
-
-        raise ValueError(f"Model returned an invalid knowledge-base filename: {raw[:500]}")
+        if (result.content or "").strip().upper() == "UNSUPPORTED" or (repaired.content or "").strip().upper() == "UNSUPPORTED":
+            raise UnsupportedRequest("The user's request does not match any discovered knowledge base.")
+        raise ValueError(f"Model returned invalid KB ID: {(repaired.content or '')[:500]}")
 
     @staticmethod
-    def _normalize_classifier_output(raw: str) -> str:
-        value = (raw or "").strip().strip("`\"'")
-        if value.lower().startswith("kb:"):
-            value = value[3:].strip()
-        if value.lower().startswith("knowledge base:"):
-            value = value[len("knowledge base:") :].strip()
-        return value.rstrip(".! ")
+    def _extract_kb_id(raw: str, candidates: dict[str, dict[str, Any]]) -> str | None:
+        text = (raw or "").strip()
+        if not text:
+            return None
 
-    @staticmethod
-    def _parse_kb_tools(kb: str) -> dict[str, str]:
-        """Parse executable tool names directly from the KB's AVAILABLE TOOLS section."""
-        match = re.search(r"(?ms)^##\s+\d+\.\s+AVAILABLE TOOLS\b(.*?)(?=^##\s+|\Z)", kb)
-        section = match.group(1) if match else kb
-        tools: dict[str, str] = {}
-        current_type: str | None = None
+        aliases = {kb_id.lower(): kb_id for kb_id in candidates}
+        cleaned = text.strip("` \"'\t\r\n")
+        for prefix in ("kb:", "kb_id:", "knowledge_base:", "category:"):
+            if cleaned.lower().startswith(prefix):
+                cleaned = cleaned[len(prefix):].strip().strip("` \"'")
+                break
+        if cleaned.lower() in aliases:
+            return aliases[cleaned.lower()]
 
-        for line in section.splitlines():
-            heading = re.match(r"^###\s+(.+?)\s*$", line)
-            if heading:
-                title = heading.group(1).lower()
-                if "diagnostic" in title:
-                    current_type = "DIAGNOSTIC"
-                elif "fix" in title or "l1 action" in title or "l1 fix" in title:
-                    current_type = "FIX"
-                else:
-                    current_type = None
+        try:
+            data = parse_json_object(text)
+        except Exception:
+            data = None
+        if isinstance(data, dict):
+            for key in ("kb_id", "knowledge_base", "category", "id"):
+                value = str(data.get(key, "")).strip()
+                if value.lower() in aliases:
+                    return aliases[value.lower()]
+
+        # Accept a single exact ID embedded in a short accidental wrapper such
+        # as "The best KB is internet_issues" but never fuzzy-match long text.
+        lower = text.lower()
+        matches = [canonical for alias, canonical in aliases.items() if alias in lower]
+        if len(matches) == 1 and len(text) <= 250:
+            return matches[0]
+        return None
+
+    def _get_decision_with_repair(self, context: str, backend: str) -> dict[str, Any]:
+        result = self.provider.complete(ORCHESTRATOR_SYSTEM_PROMPT, context, backend, json_mode=True)
+        try:
+            return parse_json_object(result.content)
+        except Exception as first_exc:
+            repair_prompt = (
+                f"{context}\n\n{PROTOCOL_REPAIR_PROMPT}\n"
+                f"RUNTIME PARSE ERROR: {first_exc}"
+            )
+            repaired = self.provider.complete(ORCHESTRATOR_SYSTEM_PROMPT, repair_prompt, backend, json_mode=True)
+            try:
+                return parse_json_object(repaired.content)
+            except Exception as second_exc:
+                raise ValueError(f"Model returned invalid orchestration JSON after one repair: {second_exc}") from second_exc
+
+    def _repair_decision(self, context: str, backend: str, runtime_issue: str) -> dict[str, Any] | None:
+        for _ in range(MAX_PROTOCOL_REPAIRS):
+            prompt = f"{context}\n\n{PROTOCOL_REPAIR_PROMPT}\nRUNTIME VALIDATION ERROR:\n{runtime_issue}"
+            try:
+                result = self.provider.complete(ORCHESTRATOR_SYSTEM_PROMPT, prompt, backend, json_mode=True)
+                return parse_json_object(result.content)
+            except Exception:
                 continue
-
-            if current_type is None:
-                continue
-
-            cell = re.match(r"^\|\s*`([A-Za-z_][A-Za-z0-9_]*)`\s*\|", line)
-            if cell:
-                tools[cell.group(1)] = current_type
-
-        return tools
+        return None
 
     @staticmethod
-    def _build_context(
-        kb_filename: str,
-        kb: str,
+    def _normalize_decision(raw: dict[str, Any], kb_id: str) -> dict[str, Any]:
+        """Normalize the new protocol and the previous build's protocol.
+
+        This is intentionally a compatibility layer so an older model prompt
+        cannot crash the entire session just because it used the old fields.
+        """
+        decision = str(raw.get("decision", "")).strip().lower()
+        if not decision:
+            status = str(raw.get("status", "")).strip().upper()
+            action_type = str(raw.get("action_type", "")).strip().upper()
+            action = str(raw.get("action", "")).strip()
+            if action_type in {"DIAGNOSTIC", "FIX"} and action:
+                decision = "tool_call"
+            elif action_type == "ASK_USER":
+                decision = "ask_user"
+            elif action_type == "RESOLVED" or status == "RESOLVED":
+                decision = "resolved"
+            elif action_type == "ESCALATE" or status == "TICKET_REQUIRED":
+                decision = "escalate"
+
+        phase = str(raw.get("phase", "")).strip().upper() or "ANALYSIS"
+        message = str(raw.get("message", "")).strip()
+        reason = str(raw.get("reason", "")).strip()
+
+        if decision == "tool_call":
+            tool = str(raw.get("tool", raw.get("action", ""))).strip()
+            arguments = raw.get("arguments", {})
+            if not isinstance(arguments, dict):
+                raise ValueError("tool_call arguments must be an object")
+            if not tool:
+                raise ValueError("tool_call is missing tool")
+            if phase not in {"TEST", "DIAGNOSIS", "ANALYSIS", "FIX", "VERIFY", "RETRY"}:
+                raise ValueError(f"invalid tool_call phase '{phase}'")
+            return {
+                "decision": "tool_call",
+                "phase": phase,
+                "tool": tool,
+                "arguments": arguments,
+                "message": message,
+                "reason": reason,
+            }
+
+        if decision == "ask_user":
+            if not message:
+                raise ValueError("ask_user requires message")
+            return {"decision": "ask_user", "phase": phase, "message": message, "reason": reason}
+
+        if decision == "resolved":
+            problem_verified = bool(raw.get("problem_verified", False))
+            verification_successful = bool(raw.get("verification_successful", False))
+            if not verification_successful:
+                raise ValueError("resolved requires verification_successful=true")
+            return {
+                "decision": "resolved",
+                "phase": "RESOLVED",
+                "status": "RESOLVED",
+                "problem_verified": problem_verified,
+                "verification_successful": verification_successful,
+                "message": message or "The issue is resolved or could not be reproduced.",
+                "reason": reason,
+            }
+
+        if decision in {"escalate", "ticket_required"}:
+            return {
+                "decision": "escalate",
+                "phase": "ESCALATE",
+                "status": "TICKET_REQUIRED",
+                "problem_verified": bool(raw.get("problem_verified", False)),
+                "verification_successful": bool(raw.get("verification_successful", False)),
+                "message": message or "This issue requires escalation to a higher support level.",
+                "reason": reason or "L1 knowledge-base remediation is exhausted or out of scope.",
+            }
+
+        raise ValueError(f"unknown decision type '{decision}' for KB '{kb_id}'")
+
+    @staticmethod
+    def _kb_capabilities(kb: dict[str, Any]) -> set[str]:
+        labels = kb.get("tool_labels", {})
+        if not isinstance(labels, dict):
+            raise ValueError("tool_labels must be a dictionary")
+        found: set[str] = set()
+        for values in labels.values():
+            if not isinstance(values, list):
+                raise ValueError("every tool_labels group must be a list")
+            found.update(str(value).strip() for value in values if str(value).strip())
+        if not found:
+            raise ValueError("knowledge base has no executable capabilities")
+        return found
+
+    @staticmethod
+    def _tool_group(kb: dict[str, Any], group: str) -> list[str]:
+        values = kb.get("tool_labels", {}).get(group, [])
+        return [str(x).strip() for x in values if str(x).strip()]
+
+    @staticmethod
+    def _validate_arguments(arguments: dict[str, Any], definition: ToolDefinition) -> bool:
+        if not definition.argument_schema:
+            return arguments == {}
+        if not isinstance(arguments, dict):
+            return False
+        allowed = set(definition.argument_schema)
+        if any(key not in allowed for key in arguments):
+            return False
+        # Values are deliberately string-only for the current Windows tools.
+        # Empty strings are rejected where a value was supplied.
+        return all(isinstance(value, str) and value.strip() for value in arguments.values())
+
+    @staticmethod
+    def _feedback_explicitly_retries(user_feedback: list[str], tool_name: str) -> bool:
+        text = " ".join(user_feedback[-3:]).lower()
+        tool = tool_name.lower()
+        retry_words = ("retry", "try again", "run it again", "repeat", "do it again")
+        return tool in text and any(word in text for word in retry_words)
+
+    @staticmethod
+    def _build_orchestrator_context(
+        *,
+        kb_id: str,
+        kb: dict[str, Any],
         problem: str,
-        history: list[dict],
-        kb_tools: dict[str, str],
+        history: list[dict[str, Any]],
+        allowed: set[str],
+        user_feedback: list[str],
+        post_fix_verification_required: bool,
     ) -> str:
-        history_text = "None" if not history else "\n\n".join(
-            f"Step {i}: {item['tool']} | success={item['success']}\n"
-            f"Arguments: {item.get('arguments', {})}\n"
-            f"{item['output']}"
-            for i, item in enumerate(history, 1)
+        tool_metadata = []
+        capabilities = get_capabilities()
+        for name in sorted(allowed):
+            tool = capabilities[name]
+            tool_metadata.append(
+                {
+                    "name": tool.name,
+                    "type": tool.category,
+                    "description": tool.description,
+                    "requires_approval": tool.requires_approval,
+                    "arguments": tool.argument_schema,
+                }
+            )
+
+        trimmed_history = history[-8:]
+        history_text = json.dumps(trimmed_history, ensure_ascii=False, indent=2)
+        if len(history_text) > 18000:
+            history_text = history_text[-18000:]
+        feedback_text = "\n".join(user_feedback[-8:]) or "None"
+        if len(feedback_text) > 5000:
+            feedback_text = feedback_text[-5000:]
+
+        return (
+            "SESSION STATE\n"
+            f"Selected KB: {kb_id}\n"
+            f"Post-fix verification required: {post_fix_verification_required}\n\n"
+            "SELECTED KNOWLEDGE BASE (AUTHORITATIVE):\n"
+            f"{json.dumps(kb, ensure_ascii=False, indent=2)}\n\n"
+            "EXACT EXECUTABLE CAPABILITIES EXPOSED FOR THIS KB:\n"
+            f"{json.dumps(tool_metadata, ensure_ascii=False, indent=2)}\n\n"
+            "ORIGINAL USER REQUEST:\n"
+            f"{problem}\n\n"
+            "ACTUAL TOOL HISTORY (NOT ASSUMPTIONS):\n"
+            f"{history_text}\n\n"
+            "USER DECISION / RETRY INSTRUCTIONS:\n"
+            f"{feedback_text}\n\n"
+            "Choose exactly one next decision. Do not return a tool that is not in the capability list."
         )
-        tool_names = "\n".join(f"- {name}: {tool_type}" for name, tool_type in sorted(kb_tools.items()))
 
-        return f'''SELECTED KNOWLEDGE-BASE FILE:
-{kb_filename}
+    def _make_resolved_report(
+        self,
+        *,
+        problem: str,
+        kb_id: str,
+        history: list[dict[str, Any]],
+        decision: dict[str, Any],
+    ) -> dict[str, Any]:
+        return {
+            "status": "RESOLVED",
+            "problem_verified": bool(decision["problem_verified"]),
+            "category": kb_id,
+            "summary": problem,
+            "diagnosis": decision["reason"],
+            "actions_taken": history,
+            "verification_successful": True,
+            "message": decision["message"],
+        }
 
-KNOWLEDGE BASE (SOURCE OF TRUTH):
-{kb}
+    def _handle_unsupported(self, problem: str, reason: str, on_event: Callable[[AgentEvent], None]) -> None:
+        try:
+            ticket_id, path = create_ticket(problem, None, [], reason)
+            report_path = save_report(
+                {
+                    "status": "TICKET_REQUIRED",
+                    "problem_verified": False,
+                    "category": None,
+                    "summary": problem,
+                    "reason": reason,
+                    "ticket_id": ticket_id,
+                },
+                REPORTS_ROOT,
+            )
+            titles = [kb.get("title", kb_id) for kb_id, kb in discover_kbs().items()]
+            supported = ", ".join(titles) if titles else "No knowledge bases are currently available."
+            message = f"I can only troubleshoot the supported L1 knowledge bases. Supported areas: {supported}."
+            on_event(
+                AgentEvent(
+                    "unsupported",
+                    message,
+                    {"ticket_id": ticket_id, "path": str(path), "report_path": str(report_path)},
+                )
+            )
+        except Exception as exc:
+            on_event(AgentEvent("internal_error", f"Could not create the unsupported-request ticket: {exc}"))
 
-EXECUTABLE ACTION NAMES DISCOVERED FROM THIS KB:
-{tool_names}
-
-USER REQUEST:
-{problem}
-
-ACTUAL TOOL HISTORY:
-{history_text}
-
-Choose exactly ONE next action. Follow the knowledge base exactly. The Python application will execute only an exact action name documented by this selected KB and for which a Python implementation exists. For any FIX action, the application will show its Yes/No approval dialog automatically. Do not use ASK_USER to request FIX approval.'''
-
-    @staticmethod
-    def _has_successful_diagnostic(history: list[dict], kb_tools: dict[str, str]) -> bool:
-        return any(
-            item.get("success") and kb_tools.get(item.get("tool")) == "DIAGNOSTIC"
-            for item in history
-        )
-
-    @staticmethod
-    def _unsupported_message() -> str:
-        filenames = sorted(discover_kbs())
-        if not filenames:
-            return "I'm sorry, my knowledge base is currently unavailable because no Markdown knowledge-base files were found."
-        joined = ", ".join(filenames)
-        return f"I'm sorry, my Knowledge base is currently limited to: {joined}."
-
-
-class UnsupportedRequest(Exception):
-    pass
+    def _handle_escalation(
+        self,
+        problem: str,
+        kb_id: str,
+        history: list[dict[str, Any]],
+        decision: dict[str, Any],
+        on_event: Callable[[AgentEvent], None],
+    ) -> None:
+        try:
+            ticket_id, path = create_ticket(problem, kb_id, history, decision["reason"])
+            report = {
+                "status": "TICKET_REQUIRED",
+                "problem_verified": bool(decision.get("problem_verified", False)),
+                "category": kb_id,
+                "summary": problem,
+                "diagnosis": decision.get("reason", ""),
+                "actions_taken": history,
+                "verification_successful": bool(decision.get("verification_successful", False)),
+                "message": decision.get("message", ""),
+                "ticket_id": ticket_id,
+            }
+            report_path = save_report(report, REPORTS_ROOT)
+            on_event(AgentEvent("ticket", decision["message"], {"ticket_id": ticket_id, "path": str(path), "report": report, "report_path": str(report_path)}))
+        except Exception as exc:
+            on_event(AgentEvent("internal_error", f"Could not create escalation ticket: {exc}"))
