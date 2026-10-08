@@ -19,6 +19,15 @@ class ProviderSettings:
 
 
 @dataclass
+class EmailSettings:
+    sender_email: str = "rohankvximcb@gmail.com"
+    smtp_password: str = ""
+    smtp_host: str = "smtp.gmail.com"
+    smtp_port: int = 465
+    security: str = "ssl"
+
+
+@dataclass
 class GenerationSettings:
     temperature: float = config.DEFAULT_TEMPERATURE
     top_p: float = config.DEFAULT_TOP_P
@@ -33,6 +42,7 @@ class AISettings:
     cloud: ProviderSettings | None = None
     lm_studio: ProviderSettings | None = None
     generation: GenerationSettings | None = None
+    email: EmailSettings | None = None
 
     def __post_init__(self) -> None:
         if self.cloud is None:
@@ -49,6 +59,8 @@ class AISettings:
             )
         if self.generation is None:
             self.generation = GenerationSettings()
+        if self.email is None:
+            self.email = EmailSettings()
         self.active_backend = normalize_backend(self.active_backend)
 
 
@@ -82,6 +94,7 @@ def _settings_from_json(raw_text: str, defaults: AISettings) -> AISettings:
         cloud=_provider_from_mapping(raw.get("cloud"), defaults.cloud),
         lm_studio=_provider_from_mapping(raw.get("lm_studio"), defaults.lm_studio),
         generation=_generation_from_mapping(raw.get("generation")),
+        email=_email_from_mapping(raw.get("email"), defaults.email),
     )
 
 
@@ -135,6 +148,25 @@ def _provider_from_mapping(raw: Any, default: ProviderSettings) -> ProviderSetti
     )
 
 
+def _email_from_mapping(raw: Any, default: EmailSettings) -> EmailSettings:
+    if not isinstance(raw, dict):
+        return default
+    try:
+        port = int(raw.get("smtp_port", default.smtp_port))
+    except (TypeError, ValueError):
+        port = default.smtp_port
+    security = str(raw.get("security", default.security) or default.security).strip().lower()
+    if security not in {"ssl", "starttls"}:
+        security = default.security
+    return EmailSettings(
+        sender_email=str(raw.get("sender_email", default.sender_email) or "").strip(),
+        smtp_password=str(raw.get("smtp_password", default.smtp_password) or "").strip(),
+        smtp_host=str(raw.get("smtp_host", default.smtp_host) or default.smtp_host).strip(),
+        smtp_port=min(65535, max(1, port)),
+        security=security,
+    )
+
+
 def _generation_from_mapping(raw: Any) -> GenerationSettings:
     defaults = GenerationSettings()
     if not isinstance(raw, dict):
@@ -183,6 +215,7 @@ def _legacy_defaults() -> AISettings:
             model=config.DEFAULT_LM_STUDIO_MODEL,
         ),
         generation=GenerationSettings(),
+        email=EmailSettings(),
     )
 
 

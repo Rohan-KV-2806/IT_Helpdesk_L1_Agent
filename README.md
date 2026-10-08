@@ -120,7 +120,7 @@ The latest hardened version is retained:
 The project is intentionally packaged as a normal top-level Python package so PyInstaller can use `run.py` as a single entry point:
 
 ```text
-L1Agent/
+IT_Helpdesk_L1_Agent/
 ├── helpdesk_agent/
 │   ├── agent/
 │   ├── knowledge/
@@ -181,3 +181,14 @@ The AI Settings dialog persists endpoint, API key, model, backend, and generatio
 
 ### Final EXE packaging
 The distribution root is `IT_Helpdesk_L1_Agent`. Run `build_exe.bat` from that folder to create `dist\L1Agent\L1Agent.exe`. Runtime-writable reports, tickets, and settings are kept outside the bundled application, under the per-user application data directory.
+
+
+## Ticket email sending
+
+When the L1 agent escalates an issue or encounters an unsupported IT request, it creates the local ticket first and then asks the user **during the same chat session** for the support team's recipient email address. The recipient is never guessed or taken from a saved recipient.
+
+The **Support Email** tab in AI Settings stores the sender email, SMTP/app password, SMTP host, SMTP port, and security mode in SQLite with the rest of the application settings. The email password is never included in tickets, reports, prompts, or logs.
+
+The LLM writes the ticket email subject, exact `to` field, and plain-text body. The application verifies that the LLM's `to` exactly matches the address entered by the user before sending. The body includes the original problem, useful diagnostics/actions, and the L1 diagnosis when one exists.
+
+For Gmail, the default SMTP configuration is `smtp.gmail.com` on port `465` with SSL. Password-based SMTP access should use a Google App Password when required; Google says App Passwords require 2-Step Verification.

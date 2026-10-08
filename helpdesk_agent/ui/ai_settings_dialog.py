@@ -151,6 +151,8 @@ class AISettingsDialog(QDialog):
         self.lm_tab = ProviderTab("LM Studio", self.settings.lm_studio)
         self.tabs.addTab(self.cloud_tab, "Cloud")
         self.tabs.addTab(self.lm_tab, "LM Studio")
+        self.email_tab = self._build_email_tab(self.settings.email)
+        self.tabs.addTab(self.email_tab, "Support Email")
         root.addWidget(self.tabs, 1)
 
         advanced = QGroupBox("Generation")
@@ -200,6 +202,61 @@ class AISettingsDialog(QDialog):
         root.insertWidget(1, QLabel("Default backend"))
         root.insertWidget(2, self.active_backend)
 
+    def _build_email_tab(self, email_settings):
+        page = QWidget()
+        root = QVBoxLayout(page)
+        root.setContentsMargins(14, 14, 14, 14)
+        root.setSpacing(10)
+
+        helper = QLabel(
+            "These credentials are used only when an L1 ticket is raised. "
+            "For Gmail, use your full email address and a Google App Password rather than your normal Google password."
+        )
+        helper.setWordWrap(True)
+        root.addWidget(helper)
+
+        form = QFormLayout()
+        self.sender_email = QLineEdit(email_settings.sender_email)
+        self.sender_email.setPlaceholderText("your-support-account@gmail.com")
+        form.addRow("Sender email", self.sender_email)
+
+        self.smtp_password = QLineEdit(email_settings.smtp_password)
+        self.smtp_password.setEchoMode(QLineEdit.EchoMode.Password)
+        self.smtp_password.setPlaceholderText("Google App Password / SMTP password")
+        form.addRow("Email password", self.smtp_password)
+
+        self.smtp_host = QLineEdit(email_settings.smtp_host)
+        form.addRow("SMTP host", self.smtp_host)
+
+        self.smtp_port = QSpinBox()
+        self.smtp_port.setRange(1, 65535)
+        self.smtp_port.setValue(int(email_settings.smtp_port))
+        form.addRow("SMTP port", self.smtp_port)
+
+        self.smtp_security = QComboBox()
+        self.smtp_security.addItem("SSL", "ssl")
+        self.smtp_security.addItem("STARTTLS", "starttls")
+        security_index = 1 if str(email_settings.security).lower() == "starttls" else 0
+        self.smtp_security.setCurrentIndex(security_index)
+        form.addRow("Security", self.smtp_security)
+        root.addLayout(form)
+
+        note = QLabel("Default Gmail SMTP: smtp.gmail.com / 465 / SSL")
+        note.setStyleSheet("color: #555555;")
+        root.addWidget(note)
+        root.addStretch()
+        return page
+
+    def _email_values(self):
+        from ..settings import EmailSettings
+        return EmailSettings(
+            sender_email=self.sender_email.text().strip(),
+            smtp_password=self.smtp_password.text().strip(),
+            smtp_host=self.smtp_host.text().strip(),
+            smtp_port=int(self.smtp_port.value()),
+            security=str(self.smtp_security.currentData()),
+        )
+
     def _save(self):
         cloud = self.cloud_tab.values()
         lm = self.lm_tab.values()
@@ -210,8 +267,16 @@ class AISettingsDialog(QDialog):
             QMessageBox.warning(self, "AI Settings", "LM Studio endpoint cannot be empty.")
             return
 
+        email = self._email_values()
+        if email.sender_email and "@" not in email.sender_email:
+            QMessageBox.warning(self, "AI Settings", "Sender email does not look valid.")
+            return
+        if not email.smtp_host:
+            QMessageBox.warning(self, "AI Settings", "SMTP host cannot be empty.")
+            return
         self.settings.cloud = cloud
         self.settings.lm_studio = lm
+        self.settings.email = email
         self.settings.active_backend = self.active_backend.currentData()
         generation = self.settings.generation
         generation.temperature = self.temperature.value()

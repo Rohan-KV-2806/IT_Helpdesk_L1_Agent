@@ -232,10 +232,13 @@ def test_ask_user_opens_interactive_decision_and_stays_in_same_session():
         "cloud",
         events.append,
         lambda action, message, reason: ApprovalResponse("no", ""),
-        lambda action, message, reason: (user_decisions.append(ApprovalResponse("idea", "Check Teams instead.")) or ApprovalResponse("idea", "Check Teams instead.")),
+        lambda action, message, reason: (
+            user_decisions.append(ApprovalResponse("idea", "Check Teams instead."))
+            or (ApprovalResponse("idea", "support@example.com") if action == "EMAIL_RECIPIENT" else ApprovalResponse("idea", "Check Teams instead."))
+        ),
     )
 
-    assert len(user_decisions) == 1
+    assert sum(1 for item in user_decisions if item.instruction == "Check Teams instead.") >= 1
     assert user_decisions[0].instruction == "Check Teams instead."
     assert any(event.kind == "tool" and event.payload and event.payload.get("tool") == "check_named_process" for event in events)
     assert not any(event.kind == "internal_error" for event in events)
@@ -475,3 +478,203 @@ def test_legacy_json_is_migrated_to_sqlite(monkeypatch, tmp_path):
     loaded_again = load_settings()
     assert loaded_again.cloud.api_key == "legacy-key"
     assert loaded_again.lm_studio.model == "local-model"
+
+def test_ticket_email_draft_requires_exact_user_recipient():
+    from helpdesk_agent.notifications.email import generate_ticket_email
+    from helpdesk_agent.llm.provider import ModelResult
+
+    class EmailProvider:
+        def complete(self, system_prompt, user_prompt, backend, *, json_mode=False):
+            return ModelResult(
+                '{"subject":"Ticket TKT-1: Memory pressure","to":"support@example.com","body":"User reports high memory usage. Diagnosis: memory pressure remains."}',
+                backend,
+            )
+
+    draft = generate_ticket_email(
+        EmailProvider(),
+        "cloud",
+        recipient="support@example.com",
+        ticket_id="TKT-1",
+        problem="memory is full",
+        category="cpu_memory_issue",
+        diagnosis="Memory pressure remains.",
+        actions=[{"category":"DIAGNOSTIC","tool":"check_system_performance","success":True,"output":"92% memory"}],
+        status="TICKET_REQUIRED",
+        escalation_reason="No safe L1 action remains.",
+    )
+    assert draft.to == "support@example.com"
+    assert "memory pressure" in draft.body.lower()
+
+
+def test_ticket_email_draft_rejects_llm_recipient_change():
+    import pytest
+    from helpdesk_agent.notifications.email import generate_ticket_email
+    from helpdesk_agent.llm.provider import ModelResult
+
+    class BadEmailProvider:
+        def complete(self, system_prompt, user_prompt, backend, *, json_mode=False):
+            return ModelResult(
+                '{"subject":"Ticket","to":"attacker@example.com","body":"Ticket body"}',
+                backend,
+            )
+
+    with pytest.raises(ValueError, match="recipient"):
+        generate_ticket_email(
+            BadEmailProvider(),
+            "cloud",
+            recipient="support@example.com",
+            ticket_id="TKT-1",
+            problem="problem",
+            category="internet_issues",
+            diagnosis="DNS issue",
+            actions=[],
+            status="TICKET_REQUIRED",
+            escalation_reason="Escalation required.",
+        )
+
+
+def test_send_email_uses_configured_smtp_and_does_not_log_password(monkeypatch):
+    from helpdesk_agent.notifications.email import EmailDraft, send_email
+    from helpdesk_agent.settings import EmailSettings
+
+    events = []
+
+    class FakeSMTP:
+        def __init__(self, host, port, **kwargs):
+            events.append(("init", host, port, kwargs))
+        def __enter__(self):
+            return self
+        def __exit__(self, exc_type, exc, tb):
+            events.append(("exit",))
+        def login(self, username, password):
+            events.append(("login", username, password))
+        def send_message(self, message):
+            events.append(("send", message["To"], message["Subject"], message.get_content()))
+
+    monkeypatch.setattr("smtplib.SMTP_SSL", FakeSMTP)
+    secret = "test-app-password"
+    send_email(
+        EmailSettings(sender_email="sender@gmail.com", smtp_password=secret, smtp_host="smtp.gmail.com", smtp_port=465, security="ssl"),
+        EmailDraft("Ticket subject", "support@example.com", "Diagnosis: test"),
+    )
+    assert events[0][0] == "init"
+    assert events[1] == ("login", "sender@gmail.com", secret)
+    assert events[2][0] == "send"
+
+
+def test_escalation_asks_recipient_and_sends_email_in_same_session(monkeypatch):
+    from helpdesk_agent.llm.provider import ModelResult
+
+    class EscalationProvider:
+        def __init__(self):
+            self.calls = 0
+        def complete(self, system_prompt, user_prompt, backend, *, json_mode=False):
+            if "classification gate" in system_prompt:
+                return ModelResult("internet_issues", backend)
+            self.calls += 1
+            if self.calls == 1:
+                return ModelResult(
+                    '{"decision":"tool_call","phase":"TEST","tool":"check_adapter_state","arguments":{},"message":"Checking adapter.","reason":"Initial connectivity test."}',
+                    backend,
+                )
+            if self.calls == 2:
+                return ModelResult(
+                    '{"decision":"escalate","phase":"ESCALATE","status":"TICKET_REQUIRED","problem_verified":true,"verification_successful":false,"message":"Escalating to support.","reason":"No safe L1 remediation remains."}',
+                    backend,
+                )
+            return ModelResult(
+                '{"subject":"Ticket TKT: Internet issue","to":"support@example.com","body":"User reports an Internet issue. Diagnosis: No safe L1 remediation remains."}',
+                backend,
+            )
+
+    import helpdesk_agent.agent.service as agent_service_module
+    import helpdesk_agent.ticketing.service as ticketing_service_module
+    from helpdesk_agent.settings import EmailSettings
+    from pathlib import Path
+
+    service = AgentService(provider=EscalationProvider())
+    original = service.capabilities["check_adapter_state"]
+    service.capabilities["check_adapter_state"] = ToolDefinition(
+        original.name, original.category, original.description, original.requires_approval,
+        lambda _args: ToolResult(True, "adapter ok"), original.argument_schema
+    )
+    monkeypatch.setattr(agent_service_module, "REPORTS_ROOT", Path(monkeypatch.tmpdir if hasattr(monkeypatch, 'tmpdir') else '/tmp'))
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        monkeypatch.setattr(agent_service_module, "REPORTS_ROOT", tmp_path / "reports")
+        monkeypatch.setattr(ticketing_service_module, "TICKETS_ROOT", tmp_path / "tickets")
+        original_settings_loader = agent_service_module.load_settings
+        class E:
+            pass
+        dummy = E(); dummy.email = EmailSettings(sender_email="sender@gmail.com", smtp_password="secret")
+        dummy.generation = None
+        monkeypatch.setattr(agent_service_module, "load_settings", lambda: dummy)
+        sent = []
+        monkeypatch.setattr("helpdesk_agent.agent.service.send_email", lambda settings, draft: sent.append((draft.to, draft.subject, draft.body)))
+
+        events = []
+        answers = []
+        def ask(action, message, reason):
+            answers.append(action)
+            if action == "EMAIL_RECIPIENT":
+                return ApprovalResponse("idea", "support@example.com")
+            return ApprovalResponse("no", "")
+
+        service.run("internet is broken", "cloud", events.append, ask, ask)
+
+        assert "EMAIL_RECIPIENT" in answers
+        assert sent and sent[0][0] == "support@example.com"
+        assert any(e.kind == "ticket" for e in events)
+        assert not any(e.kind == "internal_error" for e in events)
+
+
+
+def test_email_settings_round_trip_in_sqlite(monkeypatch, tmp_path):
+    from helpdesk_agent import config
+    from helpdesk_agent.settings import AISettings, EmailSettings, load_settings, save_settings
+
+    monkeypatch.setattr(config, "SETTINGS_DB_PATH", tmp_path / "settings.db")
+    monkeypatch.setattr(config, "SETTINGS_PATH", tmp_path / "legacy.json")
+    value = AISettings(email=EmailSettings(
+        sender_email="sender@gmail.com",
+        smtp_password="secret",
+        smtp_host="smtp.gmail.com",
+        smtp_port=465,
+        security="ssl",
+    ))
+    save_settings(value)
+    loaded = load_settings()
+    assert loaded.email.sender_email == "sender@gmail.com"
+    assert loaded.email.smtp_password == "secret"
+    assert loaded.email.smtp_port == 465
+
+
+def test_ticket_email_llm_draft_repair_preserves_recipient():
+    from helpdesk_agent.notifications.email import generate_ticket_email
+    from helpdesk_agent.llm.provider import ModelResult
+
+    class RepairProvider:
+        def __init__(self):
+            self.calls = 0
+        def complete(self, system_prompt, user_prompt, backend, *, json_mode=False):
+            self.calls += 1
+            if self.calls == 1:
+                return ModelResult('{"subject":"bad","to":"other@example.com"}', backend)
+            return ModelResult('{"subject":"Ticket fixed","to":"support@example.com","body":"Diagnosis: DNS issue."}', backend)
+
+    provider = RepairProvider()
+    draft = generate_ticket_email(
+        provider,
+        "cloud",
+        recipient="support@example.com",
+        ticket_id="TKT-1",
+        problem="internet broken",
+        category="internet_issues",
+        diagnosis="DNS issue",
+        actions=[],
+        status="TICKET_REQUIRED",
+        escalation_reason="No safe L1 remediation remains.",
+    )
+    assert provider.calls == 2
+    assert draft.to == "support@example.com"
+    assert draft.subject == "Ticket fixed"

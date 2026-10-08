@@ -14,7 +14,8 @@ from ..config import (
 from ..settings import load_settings
 from ..knowledge.store import build_kb_catalog, discover_kbs, load_kb
 from ..llm.provider import ModelProvider, ModelProviderError, parse_json_object
-from ..ticketing.service import create_ticket, save_report
+from ..ticketing.service import create_ticket, save_report, update_ticket_email
+from ..notifications.email import EmailDraft, generate_ticket_email, is_valid_email, send_email
 from ..tools.capabilities import ToolDefinition, ToolResult, get_capabilities
 
 
@@ -73,7 +74,7 @@ class AgentService:
                 return
             kb = load_kb(kb_id)
         except UnsupportedRequest as exc:
-            self._handle_unsupported(problem, str(exc), on_event)
+            self._handle_unsupported(problem, str(exc), backend, request_user_decision, on_event)
             return
         except Exception as exc:
             on_event(AgentEvent("internal_error", f"Agent startup failed: {exc}"))
@@ -249,7 +250,7 @@ class AgentService:
                 # tool call. Continue through the normal safety/execution path.
 
             if decision_type == "escalate":
-                self._handle_escalation(problem, kb_id, history, normalized, on_event)
+                self._handle_escalation(problem, kb_id, history, normalized, backend, request_user_decision, on_event)
                 return
 
             if decision_type == "ask_user":
@@ -301,7 +302,7 @@ class AgentService:
                     if normalized["decision"] == "resolved":
                         on_event(AgentEvent("internal_error", "LLM repair attempted to resolve without executing the required tool."))
                     elif normalized["decision"] == "escalate":
-                        self._handle_escalation(problem, kb_id, history, normalized, on_event)
+                        self._handle_escalation(problem, kb_id, history, normalized, backend, request_user_decision, on_event)
                     else:
                         on_event(AgentEvent("ask", normalized.get("message", "More user information is required.")))
                     return
@@ -426,7 +427,7 @@ class AgentService:
                             on_event(AgentEvent("status", "Your response was sent to the LLM. Continuing the current troubleshooting session…"))
                             continue
                         if normalized["decision"] == "escalate":
-                            self._handle_escalation(problem, kb_id, history, normalized, on_event)
+                            self._handle_escalation(problem, kb_id, history, normalized, backend, request_user_decision, on_event)
                             return
                         on_event(AgentEvent("internal_error", "LLM returned an unsupported repaired decision after a declined FIX."))
                         return
@@ -471,7 +472,7 @@ class AgentService:
                             on_event(AgentEvent("status", "Your response was sent to the LLM. Continuing the current troubleshooting session…"))
                             continue
                         if normalized["decision"] == "escalate":
-                            self._handle_escalation(problem, kb_id, history, normalized, on_event)
+                            self._handle_escalation(problem, kb_id, history, normalized, backend, request_user_decision, on_event)
                             return
                         on_event(AgentEvent("internal_error", "LLM returned an unsupported repaired decision after a repeated FIX."))
                         return
@@ -894,9 +895,124 @@ class AgentService:
             "message": decision["message"],
         }
 
-    def _handle_unsupported(self, problem: str, reason: str, on_event: Callable[[AgentEvent], None]) -> None:
+    def _request_ticket_recipient(
+        self,
+        request_user_decision: Callable[[str, str, str], ApprovalResponse] | None,
+        on_event: Callable[[AgentEvent], None],
+    ) -> str | None:
+        if request_user_decision is None:
+            on_event(AgentEvent("internal_error", "Ticket email recipient input is unavailable in this UI."))
+            return None
+        on_event(
+            AgentEvent(
+                "ask",
+                "I need the support team's email address before I can send this ticket. Please enter the recipient email in the prompt.",
+                {"action": "EMAIL_RECIPIENT"},
+            )
+        )
+        response = request_user_decision(
+            "EMAIL_RECIPIENT",
+            "Enter the support team's email address that should receive this ticket.",
+            "The recipient is required for this ticket email and will not be guessed or taken from settings.",
+        )
+        if response.choice != "idea":
+            on_event(AgentEvent("status", "No recipient was provided. The ticket will still be saved locally."))
+            return None
+        recipient = response.instruction.strip()
+        if not is_valid_email(recipient):
+            on_event(AgentEvent("internal_error", "The support recipient email address is invalid. The ticket was saved locally, but the email was not sent."))
+            return None
+        return recipient
+
+    def _send_ticket_email(
+        self,
+        *,
+        problem: str,
+        category: str | None,
+        history: list[dict[str, Any]],
+        diagnosis: str,
+        status: str,
+        escalation_reason: str,
+        ticket_id: str,
+        ticket_path,
+        backend: str,
+        recipient: str,
+        on_event: Callable[[AgentEvent], None],
+    ) -> dict[str, Any]:
+        settings = load_settings()
+        try:
+            draft = generate_ticket_email(
+                self.provider,
+                backend,
+                recipient=recipient,
+                ticket_id=ticket_id,
+                problem=problem,
+                category=category,
+                diagnosis=diagnosis,
+                actions=history,
+                status=status,
+                escalation_reason=escalation_reason,
+            )
+            send_email(settings.email, draft)
+            email_info = {
+                "status": "SENT",
+                "recipient": draft.to,
+                "subject": draft.subject,
+            }
+            update_ticket_email(ticket_path, email_info)
+            on_event(
+                AgentEvent(
+                    "email",
+                    f"Ticket {ticket_id} was emailed to {draft.to}.",
+                    {"ticket_id": ticket_id, "recipient": draft.to, "subject": draft.subject, "body": draft.body},
+                )
+            )
+            return email_info
+        except Exception as exc:
+            email_info = {
+                "status": "FAILED",
+                "recipient": recipient,
+                "error": str(exc),
+            }
+            try:
+                update_ticket_email(ticket_path, email_info)
+            except Exception:
+                pass
+            on_event(
+                AgentEvent(
+                    "email_error",
+                    f"Ticket {ticket_id} was saved, but the email could not be sent: {exc}",
+                    {"ticket_id": ticket_id, "recipient": recipient, "error": str(exc)},
+                )
+            )
+            return email_info
+
+    def _handle_unsupported(
+        self,
+        problem: str,
+        reason: str,
+        backend: str,
+        request_user_decision: Callable[[str, str, str], ApprovalResponse] | None,
+        on_event: Callable[[AgentEvent], None],
+    ) -> None:
         try:
             ticket_id, path = create_ticket(problem, None, [], reason)
+            recipient = self._request_ticket_recipient(request_user_decision, on_event)
+            email_info = None
+            if recipient:
+                email_info = self._send_ticket_email(
+                    problem=problem,
+                    category=None,
+                    history=[],
+                    diagnosis="",
+                    status="TICKET_REQUIRED",
+                    escalation_reason=reason,
+                    ticket_id=ticket_id,
+                    ticket_path=path,
+                    backend=backend,
+                    recipient=recipient,
+                    on_event=on_event,
+                )
             report_path = save_report(
                 {
                     "status": "TICKET_REQUIRED",
@@ -905,6 +1021,7 @@ class AgentService:
                     "summary": problem,
                     "reason": reason,
                     "ticket_id": ticket_id,
+                    "email": email_info,
                 },
                 REPORTS_ROOT,
             )
@@ -915,7 +1032,7 @@ class AgentService:
                 AgentEvent(
                     "unsupported",
                     message,
-                    {"ticket_id": ticket_id, "path": str(path), "report_path": str(report_path)},
+                    {"ticket_id": ticket_id, "path": str(path), "report_path": str(report_path), "email": email_info},
                 )
             )
         except Exception as exc:
@@ -927,10 +1044,28 @@ class AgentService:
         kb_id: str,
         history: list[dict[str, Any]],
         decision: dict[str, Any],
+        backend: str,
+        request_user_decision: Callable[[str, str, str], ApprovalResponse] | None,
         on_event: Callable[[AgentEvent], None],
     ) -> None:
         try:
             ticket_id, path = create_ticket(problem, kb_id, history, decision["reason"])
+            recipient = self._request_ticket_recipient(request_user_decision, on_event)
+            email_info = None
+            if recipient:
+                email_info = self._send_ticket_email(
+                    problem=problem,
+                    category=kb_id,
+                    history=history,
+                    diagnosis=decision.get("reason", ""),
+                    status="TICKET_REQUIRED",
+                    escalation_reason=decision.get("reason", ""),
+                    ticket_id=ticket_id,
+                    ticket_path=path,
+                    backend=backend,
+                    recipient=recipient,
+                    on_event=on_event,
+                )
             report = {
                 "status": "TICKET_REQUIRED",
                 "problem_verified": bool(decision.get("problem_verified", False)),
@@ -941,8 +1076,22 @@ class AgentService:
                 "verification_successful": bool(decision.get("verification_successful", False)),
                 "message": decision.get("message", ""),
                 "ticket_id": ticket_id,
+                "email": email_info,
             }
             report_path = save_report(report, REPORTS_ROOT)
-            on_event(AgentEvent("ticket", decision["message"], {"ticket_id": ticket_id, "path": str(path), "report": report, "report_path": str(report_path)}))
+            on_event(
+                AgentEvent(
+                    "ticket",
+                    decision["message"],
+                    {
+                        "ticket_id": ticket_id,
+                        "path": str(path),
+                        "report": report,
+                        "report_path": str(report_path),
+                        "email": email_info,
+                    },
+                )
+            )
         except Exception as exc:
             on_event(AgentEvent("internal_error", f"Could not create escalation ticket: {exc}"))
+

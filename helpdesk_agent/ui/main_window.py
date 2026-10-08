@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..agent.service import AgentEvent, AgentService, ApprovalResponse
+from ..notifications.email import is_valid_email
 from ..settings import load_settings, normalize_backend
 from .ai_settings_dialog import AISettingsDialog
 
@@ -277,6 +278,8 @@ class MainWindow(QMainWindow):
             "unsupported": "Agent",
             "general_chat": "Agent",
             "ask": "Agent",
+            "email": "Email",
+            "email_error": "Email Error",
             "internal_error": "Error",
         }
         self._append(labels.get(event.kind, "Agent"), event.message)
@@ -299,6 +302,26 @@ class MainWindow(QMainWindow):
 
     @Slot(object, str, str)
     def on_user_decision(self, action: str, message: str, reason: str):
+        if action == "EMAIL_RECIPIENT":
+            from PySide6.QtWidgets import QInputDialog
+            while True:
+                recipient, ok = QInputDialog.getText(
+                    self,
+                    "Support Team Email",
+                    "Enter the support team's recipient email:",
+                )
+                recipient = recipient.strip()
+                if not ok:
+                    choice = ApprovalResponse("no", "")
+                    break
+                if is_valid_email(recipient):
+                    choice = ApprovalResponse("idea", recipient)
+                    break
+                QMessageBox.warning(self, "Support Team Email", "Enter a valid recipient email address.")
+            if self.worker:
+                self.worker.respond_to_approval(choice)
+            return
+
         dialog = DecisionDialog(self, action, message, reason)
         dialog.exec()
         if self.worker:
