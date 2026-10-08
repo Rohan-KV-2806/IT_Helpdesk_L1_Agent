@@ -8,15 +8,22 @@ from dotenv import load_dotenv
 
 
 if getattr(sys, "frozen", False):
-    _default_project_root = Path(sys.executable).resolve().parent
+    _default_project_root = Path(os.getenv("APPDATA", Path.home() / "AppData" / "Roaming")) / "L1Agent"
 else:
-    _default_project_root = Path(__file__).resolve().parents[2]
+    _default_project_root = Path(__file__).resolve().parents[1]
 
 PROJECT_ROOT = Path(os.getenv("HELPDESK_PROJECT_ROOT", str(_default_project_root))).expanduser().resolve()
 KB_ROOT = Path(__file__).resolve().parent / "knowledge"
+SETTINGS_PATH = PROJECT_ROOT / "settings.json"
+SETTINGS_DB_PATH = PROJECT_ROOT / "settings.db"
 TICKETS_ROOT = PROJECT_ROOT / "tickets"
 REPORTS_ROOT = PROJECT_ROOT / "reports"
+
+# Source builds may still use the old .env file. SQLite is the primary
+# persistent settings store; the legacy JSON file is only used for migration.
 load_dotenv(PROJECT_ROOT / ".env")
+if not getattr(sys, "frozen", False):
+    load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
 
 def _env_int(name: str, default: int) -> int:
@@ -33,19 +40,24 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
-CLOUD_API_ENDPOINT = os.getenv("CLOUD_API_ENDPOINT", "https://integrate.api.nvidia.com/v1").strip()
-CLOUD_API_KEY = os.getenv("CLOUD_API_KEY", "").strip()
-CLOUD_MODEL = os.getenv("CLOUD_MODEL", "").strip()
-LOCAL_MODEL = os.getenv("LOCAL_MODEL", "").strip()
-MODEL_CONTEXT = max(2048, _env_int("MODEL_CONTEXT", 8192))
-MODEL_THREADS = max(1, _env_int("MODEL_THREADS", 2))
-MODEL_MAX_TOKENS = max(256, _env_int("MODEL_MAX_TOKENS", 1200))
-TEMPERATURE = min(2.0, max(0.0, _env_float("TEMPERATURE", 0.0)))
-TOP_P = min(1.0, max(0.0, _env_float("TOP_P", 0.9)))
-MAX_AGENT_STEPS = max(4, _env_int("MAX_AGENT_STEPS", 14))
-MAX_PROTOCOL_REPAIRS = max(1, _env_int("MAX_PROTOCOL_REPAIRS", 2))
-LOCAL_N_GPU_LAYERS = _env_int("LOCAL_N_GPU_LAYERS", 0)
-LOCAL_CHAT_TEMPLATE_THINKING = os.getenv("LOCAL_CHAT_TEMPLATE_THINKING", "false").lower() == "true"
+DEFAULT_CLOUD_API_ENDPOINT = os.getenv("CLOUD_API_ENDPOINT", "https://integrate.api.nvidia.com/v1").strip()
+DEFAULT_CLOUD_API_KEY = os.getenv("CLOUD_API_KEY", "").strip()
+DEFAULT_CLOUD_MODEL = os.getenv("CLOUD_MODEL", "").strip()
+DEFAULT_LM_STUDIO_ENDPOINT = os.getenv("LM_STUDIO_ENDPOINT", "http://localhost:1234/v1").strip()
+DEFAULT_LM_STUDIO_API_KEY = os.getenv("LM_STUDIO_API_KEY", "").strip()
+DEFAULT_LM_STUDIO_MODEL = os.getenv("LM_STUDIO_MODEL", "").strip()
+DEFAULT_MODEL_MAX_TOKENS = max(256, _env_int("MODEL_MAX_TOKENS", 1200))
+DEFAULT_TEMPERATURE = min(2.0, max(0.0, _env_float("TEMPERATURE", 0.0)))
+DEFAULT_TOP_P = min(1.0, max(0.0, _env_float("TOP_P", 0.9)))
+DEFAULT_MAX_AGENT_STEPS = max(4, _env_int("MAX_AGENT_STEPS", 14))
+DEFAULT_MAX_PROTOCOL_REPAIRS = max(1, _env_int("MAX_PROTOCOL_REPAIRS", 2))
+
+# Backwards-compatible aliases for code/tests that still import these names.
+MODEL_MAX_TOKENS = DEFAULT_MODEL_MAX_TOKENS
+TEMPERATURE = DEFAULT_TEMPERATURE
+TOP_P = DEFAULT_TOP_P
+MAX_AGENT_STEPS = DEFAULT_MAX_AGENT_STEPS
+MAX_PROTOCOL_REPAIRS = DEFAULT_MAX_PROTOCOL_REPAIRS
 
 CLASSIFIER_SYSTEM_PROMPT = r"""
 You are the IT Helpdesk L1 classification gate.

@@ -1,8 +1,12 @@
-.env
 __pycache__/
+.pytest_cache/
+build/
+dist/
 *.pyc
-reports/
-tickets/
-tests/
-test/
-Past Versions/
+settings.json
+.env
+reports/*.json
+tickets/*.json
+settings.db
+reports/*.db
+tickets/*.db

@@ -1,6 +1,6 @@
 # IT Helpdesk L1 Agent
 
-A lightweight Windows L1 IT Helpdesk agent with a PySide6 desktop UI, local/cloud LLM support, Python-based declarative knowledge bases, controlled Windows capabilities, approval-gated fixes, verification, retry decisions, and ticket escalation.
+A lightweight Windows L1 IT Helpdesk agent with a PySide6 desktop UI, OpenAI-compatible cloud + LM Studio backends, Python-based declarative knowledge bases, controlled Windows capabilities, approval-gated fixes, verification, retry decisions, and ticket escalation.
 
 ## Architecture
 
@@ -24,7 +24,7 @@ Repeat until RESOLVED / ASK USER / ESCALATE
 
 The LLM is the troubleshooting orchestrator. Python is the safety and execution layer.
 
-The KBs are declarative dictionaries under `src/helpdesk_agent/knowledge/`. They define:
+The KBs are declarative dictionaries under `helpdesk_agent/knowledge/`. They define:
 
 - problem categories and descriptions
 - `Testing`, `Diagnosis`, `Analysis`, `Fix`, `Verification`, `Retry`, and `Escalation`
@@ -33,7 +33,26 @@ The KBs are declarative dictionaries under `src/helpdesk_agent/knowledge/`. They
 
 There is **no hardcoded category-to-KB mapping** and no Python decision tree such as `if category == internet: ...`.
 
-The executable capability layer is deliberately separate from troubleshooting knowledge. Its job is only to implement controlled OS operations and validate inputs.
+## AI backends
+
+The application no longer loads local model files itself. There is no `llama-cpp-python` dependency and no GGUF loading path.
+
+Use **LM Studio** for local models: start the LM Studio server, point the agent to its OpenAI-compatible endpoint (default `http://localhost:1234/v1`), then select one of the models returned by `GET /v1/models`. LM Studio documents `/v1/models` as its OpenAI-compatible model-list endpoint and `/v1/chat/completions` for chat/tool use.
+
+Cloud providers that expose an OpenAI-compatible chat endpoint can be configured the same way.
+
+## AI Settings
+
+Click **AI Settings** in the main window to configure:
+
+- Cloud endpoint, API key, and model
+- LM Studio endpoint, optional API token, and model
+- model lists loaded directly from each provider
+- temperature, top-p, max output tokens, and max agent steps
+
+The model selector is editable, so a provider can still be used when its `/models` endpoint is unavailable by typing a known model ID manually.
+
+Settings are stored in `settings.json`. For the packaged EXE, the application data directory defaults to `%APPDATA%\\L1Agent`, keeping mutable settings, reports, and tickets out of the bundled executable directory.
 
 ## Included knowledge bases
 
@@ -82,91 +101,83 @@ For every state-changing fix, the existing UI shows:
 - **No** — do not execute it; return the decision to the LLM for reconsideration.
 - **Your idea** — send free-form troubleshooting instructions to the current LLM session. It never goes through KB classification.
 
-The LLM decides whether the idea corresponds to a safe documented diagnostic/fix, or whether it should reject the request and continue safely.
+An `ask_user` decision also opens the same interactive window immediately. The response returns directly to the existing troubleshooting session.
 
-## Error handling
+## Process/memory safety
 
-The runtime is fail-closed:
+The latest hardened version is retained:
 
-- invalid classifier output is repaired once; the classifier also accepts accidental legacy JSON containing a valid KB ID
-- malformed orchestration JSON gets a bounded repair attempt
-- unknown tools, unavailable KB tools, invalid arguments, premature fixes, skipped verification, repeated tool loops, and repeated fixes are blocked
-- tool execution failures are returned to the LLM as factual tool results so the agent can choose another documented action or escalate
-- user denial does not become a new classification request
-- internal LLM/application failures never create support tickets
-- only unsupported user requests and explicit LLM escalation create tickets
-- the agent has a hard maximum-step limit to prevent infinite loops
+- process-close fixes require an exact verified PID and process name
+- the runtime re-checks the live process immediately before closing
+- the agent and its parent are protected
+- Windows/security processes are protected
+- different verified PIDs are different FIX targets even when the same capability is reused
+- a failed FIX is treated as **no system change** unless the tool result proves otherwise
+- failed targets are remembered so the LLM can choose another documented path
 
-## Run
+## EXE layout
+
+The project is intentionally packaged as a normal top-level Python package so PyInstaller can use `run.py` as a single entry point:
+
+```text
+L1Agent/
+├── helpdesk_agent/
+│   ├── agent/
+│   ├── knowledge/
+│   ├── llm/
+│   ├── ticketing/
+│   ├── tools/
+│   └── ui/
+├── tests/
+├── run.py
+├── L1Agent.spec
+├── build_exe.bat
+├── requirements.txt
+└── .env.example
+```
+
+The PyInstaller spec bundles the declarative KB Python files as runtime data because the agent discovers them from the `knowledge` directory. PyInstaller supports explicitly bundling data files and building one-file or one-folder Windows applications.
+
+Build on Windows:
+
+```bat
+python -m pip install -r requirements.txt
+build_exe.bat
+```
+
+The generated executable is placed under `dist\\L1Agent\\` by the included spec.
+
+## Run from source
 
 ```bat
 python -m pip install -r requirements.txt
 copy .env.example .env
-python -m src.helpdesk_agent.main
+python run.py
 ```
 
-Configure `.env` for either backend.
-
-Example cloud configuration:
-
-```text
-CLOUD_API_ENDPOINT=https://integrate.api.nvidia.com/v1
-CLOUD_API_KEY=YOUR_KEY_HERE
-CLOUD_MODEL=YOUR_MODEL_HERE
-```
-
-Example local configuration:
-
-```text
-LOCAL_MODEL=models/your-model.gguf
-```
-
-The local model path may be absolute or relative to the project directory.
+The AI Settings window is the recommended configuration method.
 
 ## Outputs
 
 - Escalation tickets: `tickets/`
 - Resolved/session reports: `reports/`
 
+For a packaged EXE these writable outputs are placed under `%APPDATA%\\L1Agent` by default.
+
 The application does not copy or upload model/API keys into tickets or reports.
 
 ## Testing
 
-Static validation:
-
 ```bat
-python -m compileall src
+python -m compileall helpdesk_agent run.py tests
 python -m pytest -q
 ```
 
-The tests cover KB discovery/validation, the classifier's legacy-JSON compatibility path, orchestration decision normalization, and the required post-fix verification guard without executing Windows-changing commands.
+The existing regression tests cover KB discovery/validation, classifier behavior, orchestration normalization, interactive user decisions, PID handling, failed-fix recovery, process safety, and required post-fix verification.
 
 
-## Guardrails added
-- The LLM classifier decides whether a message is a supported IT problem, GENERAL_CHAT, or UNSUPPORTED.
-- GENERAL_CHAT never creates tickets or reports and receives a fixed L1 helpdesk response.
-- A technical resolution is never finalized until the user confirms the original problem is actually solved.
-- If the user selects No or Your idea in the resolution decision window, the instruction is returned to the LLM orchestrator; classification is not repeated.
+### Persistent AI settings
+The AI Settings dialog persists endpoint, API key, model, backend, and generation settings in SQLite at `%APPDATA%\L1Agent\settings.db` for packaged builds (or the configured project root for source builds). A legacy `settings.json` is read once and migrated automatically when found. No model files are loaded by this application; local inference is provided through the LM Studio OpenAI-compatible endpoint.
 
-## Decision/input responsiveness and process targeting
-
-- `ask_user` is now an interactive decision checkpoint instead of ending the troubleshooting run. The same GUI decision window opens immediately and the response returns directly to the current orchestrator session.
-- `Your idea` remains in the current troubleshooting context; it is never reclassified as a new request.
-- The CPU/memory KB now exposes `check_named_process`, so a user-mentioned application such as Teams can be verified even when it is not in the top-memory list.
-- The memory process diagnostic excludes the agent and parent process and reports more candidates, including window titles.
-- Process-closing fixes require both the exact PID and exact process name from diagnostic evidence. The runtime re-checks the PID before closing it and protects the agent, its parent, and Windows/security processes.
-- The orchestrator is explicitly forbidden from silently substituting another user application when the user names a specific process.
-- Finishing a request never closes the application window. The L1 Agent remains open and ready for another request until the user explicitly closes it.
-
-## Latest process/memory troubleshooting hardening
-
-This build fixes the process-close execution path and the recovery behavior around failed or declined fixes. In particular:
-
-- `close_high_resource_process` now defines and protects the agent PID and parent PID before building the PowerShell command.
-- A failed FIX is recorded as a failed execution, not as a completed state change, so the loop does not incorrectly force post-fix verification.
-- The exact FIX target is tracked by capability + arguments. A different verified PID/process name may therefore reuse the same close capability.
-- Repair logic no longer treats a legitimate diagnostic, user question, or escalation after a repeated/declined FIX as an internal protocol failure.
-- The memory KB explicitly tells the orchestrator to verify a newly named application and never silently substitute another app.
-- Process closing re-checks the live PID, process name, visibility, and protected-process rules immediately before closing.
-
-PowerShell's documented `Get-Process -Id` and `Get-Process -Name` behavior is used for the runtime process checks; PID-based targeting is revalidated immediately before the state-changing action.
+### Final EXE packaging
+The distribution root is `IT_Helpdesk_L1_Agent`. Run `build_exe.bat` from that folder to create `dist\L1Agent\L1Agent.exe`. Runtime-writable reports, tickets, and settings are kept outside the bundled application, under the per-user application data directory.

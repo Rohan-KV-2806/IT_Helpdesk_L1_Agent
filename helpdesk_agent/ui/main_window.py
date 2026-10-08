@@ -20,6 +20,8 @@ from PySide6.QtWidgets import (
 )
 
 from ..agent.service import AgentEvent, AgentService, ApprovalResponse
+from ..settings import load_settings, normalize_backend
+from .ai_settings_dialog import AISettingsDialog
 
 
 class ApprovalBridge:
@@ -161,6 +163,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("L1 Agent")
         self.setFixedSize(620, 430)
+        self.settings = load_settings()
         self.service = AgentService()
         self.worker: AgentWorker | None = None
         self._build_ui()
@@ -189,10 +192,16 @@ class MainWindow(QMainWindow):
         self.problem_label.setObjectName("problem")
         controls.addWidget(self.problem_label, 1)
         self.backend = QComboBox()
-        self.backend.addItems(["cloud", "local"])
-        self.backend.setCurrentText("cloud")
-        self.backend.setFixedWidth(86)
+        self.backend.addItem("Cloud", "cloud")
+        self.backend.addItem("LM Studio", "lm_studio")
+        current_backend = normalize_backend(self.settings.active_backend)
+        self.backend.setCurrentIndex(1 if current_backend == "lm_studio" else 0)
+        self.backend.setFixedWidth(105)
         controls.addWidget(self.backend)
+        self.ai_settings = QPushButton("AI Settings")
+        self.ai_settings.setFixedWidth(96)
+        self.ai_settings.clicked.connect(self.open_ai_settings)
+        controls.addWidget(self.ai_settings)
         layout.addLayout(controls)
 
         self.chat = QTextBrowser()
@@ -246,7 +255,8 @@ class MainWindow(QMainWindow):
         self._append("Agent", "Working…")
         self.send.setEnabled(False)
         self.backend.setEnabled(False)
-        self.worker = AgentWorker(self.service, problem, self.backend.currentText())
+        self.ai_settings.setEnabled(False)
+        self.worker = AgentWorker(self.service, problem, self.backend.currentData())
         self.worker.event_signal.connect(self.on_event)
         self.worker.approval_signal.connect(self.on_approval)
         self.worker.user_decision_signal.connect(self.on_user_decision)
@@ -300,9 +310,21 @@ class MainWindow(QMainWindow):
         # until the user explicitly closes it, and a new request can be submitted.
         self.send.setEnabled(True)
         self.backend.setEnabled(True)
+        self.ai_settings.setEnabled(True)
+        self.settings = load_settings()
         self.worker = None
         self.input.setFocus()
         self.problem_label.setText("Problem: waiting for request")
+
+    @Slot()
+    def open_ai_settings(self):
+        if self.worker and self.worker.isRunning():
+            return
+        dialog = AISettingsDialog(self, self.backend.currentData())
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.settings = load_settings()
+            current_backend = normalize_backend(self.settings.active_backend)
+            self.backend.setCurrentIndex(1 if current_backend == "lm_studio" else 0)
 
     def closeEvent(self, event):
         if self.worker and self.worker.isRunning():

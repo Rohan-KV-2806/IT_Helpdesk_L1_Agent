@@ -7,12 +7,11 @@ from typing import Any, Callable, Literal
 from ..config import (
     CLASSIFIER_SYSTEM_PROMPT,
     KB_ROOT,
-    MAX_AGENT_STEPS,
-    MAX_PROTOCOL_REPAIRS,
     ORCHESTRATOR_SYSTEM_PROMPT,
     PROTOCOL_REPAIR_PROMPT,
     REPORTS_ROOT,
 )
+from ..settings import load_settings
 from ..knowledge.store import build_kb_catalog, discover_kbs, load_kb
 from ..llm.provider import ModelProvider, ModelProviderError, parse_json_object
 from ..ticketing.service import create_ticket, save_report
@@ -110,7 +109,9 @@ class AgentService:
         last_diagnostic_success = False
         resolution_declined = False
 
-        for step in range(1, MAX_AGENT_STEPS + 1):
+        runtime_settings = load_settings()
+        max_agent_steps = runtime_settings.generation.max_agent_steps if runtime_settings.generation else 14
+        for step in range(1, max_agent_steps + 1):
             on_event(AgentEvent("status", f"Step {step}: LLM deciding next action…"))
             context = self._build_orchestrator_context(
                 kb_id=kb_id,
@@ -588,7 +589,7 @@ class AgentService:
         on_event(
             AgentEvent(
                 "internal_error",
-                f"The LLM agent loop reached the maximum of {MAX_AGENT_STEPS} steps. No ticket was created because this is an internal agent-loop limit.",
+                f"The LLM agent loop reached the maximum of {max_agent_steps} steps. No ticket was created because this is an internal agent-loop limit.",
             )
         )
 
@@ -679,7 +680,9 @@ class AgentService:
                 raise ValueError(f"Model returned invalid orchestration JSON after one repair: {second_exc}") from second_exc
 
     def _repair_decision(self, context: str, backend: str, runtime_issue: str) -> dict[str, Any] | None:
-        for _ in range(MAX_PROTOCOL_REPAIRS):
+        generation = load_settings().generation
+        max_repairs = generation.max_protocol_repairs if generation else 2
+        for _ in range(max_repairs):
             prompt = f"{context}\n\n{PROTOCOL_REPAIR_PROMPT}\nRUNTIME VALIDATION ERROR:\n{runtime_issue}"
             try:
                 result = self.provider.complete(ORCHESTRATOR_SYSTEM_PROMPT, prompt, backend, json_mode=True)
