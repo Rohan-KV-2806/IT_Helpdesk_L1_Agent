@@ -192,3 +192,11 @@ The **Support Email** tab in AI Settings stores the sender email, SMTP/app passw
 The LLM writes the ticket email subject, exact `to` field, and plain-text body. The application verifies that the LLM's `to` exactly matches the address entered by the user before sending. The body includes the original problem, useful diagnostics/actions, and the L1 diagnosis when one exists.
 
 For Gmail, the default SMTP configuration is `smtp.gmail.com` on port `465` with SSL. Password-based SMTP access should use a Google App Password when required; Google says App Passwords require 2-Step Verification.
+## General support routing
+
+Requests outside the discovered troubleshooting KBs can be classified as `GENERAL_SUPPORT` when they are legitimate IT/workplace support matters that do not need local troubleshooting (for example subscription, account, access, licensing, service, or similar support requests). These requests go directly through the existing ticket + support-email workflow. The recipient email is always requested during the chat.
+
+For selected general support requests, the LLM may request the narrowly scoped `get_device_identity` diagnostic. That capability only collects Windows computer name, manufacturer/model, BIOS serial number, and hardware UUID; it cannot execute arbitrary commands.
+
+The UI was refreshed visually without changing the existing agent workflow, approval flow, ticketing, email, SQLite settings, LM Studio, or EXE packaging behavior.
+

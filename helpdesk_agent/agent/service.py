@@ -72,6 +72,11 @@ class AgentService:
                     )
                 )
                 return
+            if kb_id == "GENERAL_SUPPORT":
+                self._handle_general_support(
+                    problem, backend, request_user_decision, on_event
+                )
+                return
             kb = load_kb(kb_id)
         except UnsupportedRequest as exc:
             self._handle_unsupported(problem, str(exc), backend, request_user_decision, on_event)
@@ -602,11 +607,12 @@ class AgentService:
         prompt = (
             "AVAILABLE KNOWLEDGE BASES:\n"
             f"{build_kb_catalog()}\n\n"
-            "SPECIAL CLASSIFICATION: GENERAL_CHAT\n"
-            "Use GENERAL_CHAT for greetings, thanks, small talk, or questions about the agent itself that are not an IT support request.\n\n"
+            "SPECIAL CLASSIFICATION: GENERAL_CHAT / GENERAL_SUPPORT\n"
+            "Use GENERAL_CHAT for greetings, thanks, small talk, or questions about the agent itself that are not an IT support request.\n"
+            "Use GENERAL_SUPPORT for legitimate IT/workplace support matters outside the discovered KBs that should be sent to the support team without local troubleshooting.\n\n"
             "USER REQUEST:\n"
             f"{problem}\n\n"
-            "RETURN ONLY ONE EXACT KB ID, GENERAL_CHAT, OR UNSUPPORTED."
+            "RETURN ONLY ONE EXACT KB ID, GENERAL_CHAT, GENERAL_SUPPORT, OR UNSUPPORTED."
         )
         result = self.provider.complete(CLASSIFIER_SYSTEM_PROMPT, prompt, backend, json_mode=False)
         kb_id = self._extract_kb_id(result.content, candidates)
@@ -617,9 +623,9 @@ class AgentService:
         # troubleshooting JSON envelope during classification.
         repair_prompt = (
             "CLASSIFICATION FORMAT ERROR.\n"
-            f"The candidates are: {', '.join(candidates)}. You may also return GENERAL_CHAT or UNSUPPORTED.\n"
+            f"The candidates are: {', '.join(candidates)}. You may also return GENERAL_CHAT, GENERAL_SUPPORT, or UNSUPPORTED.\n"
             f"The previous model response was:\n{result.content[:1200]}\n\n"
-            "Return ONLY the exact KB ID or UNSUPPORTED."
+            "Return ONLY the exact KB ID, GENERAL_CHAT, GENERAL_SUPPORT, or UNSUPPORTED."
         )
         repaired = self.provider.complete(CLASSIFIER_SYSTEM_PROMPT, repair_prompt, backend, json_mode=False)
         kb_id = self._extract_kb_id(repaired.content, candidates)
@@ -638,6 +644,8 @@ class AgentService:
 
         aliases = {kb_id.lower(): kb_id for kb_id in candidates}
         aliases["general_chat"] = "GENERAL_CHAT"
+        aliases["general_support"] = "GENERAL_SUPPORT"
+        aliases["support_request"] = "GENERAL_SUPPORT"
         aliases["unsupported"] = "UNSUPPORTED"
         cleaned = text.strip("` \"'\t\r\n")
         for prefix in ("kb:", "kb_id:", "knowledge_base:", "category:"):
@@ -986,6 +994,115 @@ class AgentService:
                 )
             )
             return email_info
+
+    def _should_collect_device_identity(self, problem: str, backend: str) -> bool:
+        """Ask the LLM only whether a device identity is useful for this ticket.
+
+        This is deliberately a tiny bounded decision: it cannot run arbitrary
+        commands and the only executable identity capability is collected below.
+        Explicit device-ID requests are handled without relying on the model.
+        """
+        text = problem.lower()
+        explicit = (
+            "device id" in text
+            or "device uuid" in text
+            or "serial number" in text
+            or "machine id" in text
+            or "computer id" in text
+            or "asset id" in text
+        )
+        if explicit:
+            return True
+        try:
+            prompt = (
+                "Decide whether collecting the Windows device identity would materially help a support-team ticket for this request. "
+                'Return ONLY JSON: {"collect_device_identity":true|false}. '
+                "Choose true only when device identity is useful for identifying the affected machine or service account/device. "
+                "Do not collect it merely because it exists.\n\nUSER REQUEST:\n" + problem
+            )
+            result = self.provider.complete(
+                "You are a narrowly scoped IT support triage gate. Do not troubleshoot and do not invent tools.",
+                prompt,
+                backend,
+                json_mode=True,
+            )
+            data = parse_json_object(result.content)
+            return bool(data.get("collect_device_identity", False))
+        except Exception:
+            return False
+
+    def _handle_general_support(
+        self,
+        problem: str,
+        backend: str,
+        request_user_decision: Callable[[str, str, str], ApprovalResponse] | None,
+        on_event: Callable[[AgentEvent], None],
+    ) -> None:
+        """Route legitimate non-KB support requests directly to the support team.
+
+        No fake troubleshooting is performed. A narrowly scoped device identity
+        diagnostic may be collected when the request or LLM indicates it is
+        useful, then the normal ticket/email pipeline is used.
+        """
+        try:
+            history: list[dict[str, Any]] = []
+            if self._should_collect_device_identity(problem, backend):
+                tool = self.capabilities.get("get_device_identity")
+                if tool is None:
+                    on_event(AgentEvent("internal_error", "Device identity capability is unavailable."))
+                    return
+                on_event(AgentEvent("status", "Collecting device identity for the support ticket…"))
+                result = tool.runner({})
+                history.append({
+                    "category": tool.category,
+                    "tool": tool.name,
+                    "success": result.success,
+                    "output": result.output,
+                })
+                on_event(AgentEvent("tool", f"Running {tool.name}…"))
+                on_event(AgentEvent("tool_result", result.output, {"tool": tool.name, "success": result.success}))
+
+            reason = "The request is a legitimate support-team matter outside the local L1 troubleshooting knowledge bases."
+            ticket_id, path = create_ticket(problem, "GENERAL_SUPPORT", history, reason)
+            recipient = self._request_ticket_recipient(request_user_decision, on_event)
+            email_info = None
+            if recipient:
+                email_info = self._send_ticket_email(
+                    problem=problem,
+                    category="GENERAL_SUPPORT",
+                    history=history,
+                    diagnosis="No local troubleshooting was required for this support-team request.",
+                    status="TICKET_REQUIRED",
+                    escalation_reason=reason,
+                    ticket_id=ticket_id,
+                    ticket_path=path,
+                    backend=backend,
+                    recipient=recipient,
+                    on_event=on_event,
+                )
+            report_path = save_report(
+                {
+                    "status": "TICKET_REQUIRED",
+                    "problem_verified": False,
+                    "category": "GENERAL_SUPPORT",
+                    "summary": problem,
+                    "diagnosis": "No local troubleshooting was required; routed directly to the support team.",
+                    "actions_taken": history,
+                    "reason": reason,
+                    "ticket_id": ticket_id,
+                    "email": email_info,
+                },
+                REPORTS_ROOT,
+            )
+            on_event(
+                AgentEvent(
+                    "ticket",
+                    f"This request was routed directly to the support team. Ticket: {ticket_id}",
+                    {"ticket_id": ticket_id, "path": str(path), "report_path": str(report_path), "email": email_info},
+                )
+            )
+        except Exception as exc:
+            on_event(AgentEvent("internal_error", f"Could not create the general support ticket: {exc}"))
 
     def _handle_unsupported(
         self,

@@ -678,3 +678,46 @@ def test_ticket_email_llm_draft_repair_preserves_recipient():
     assert provider.calls == 2
     assert draft.to == "support@example.com"
     assert draft.subject == "Ticket fixed"
+
+
+def test_general_support_routes_directly_to_ticket_without_local_troubleshooting():
+    from helpdesk_agent.llm.provider import ModelResult
+    import helpdesk_agent.agent.service as agent_service_module
+
+    class SupportProvider(FakeProvider):
+        def complete(self, system_prompt, user_prompt, backend, *, json_mode=False):
+            if "classification gate" in system_prompt:
+                return ModelResult("GENERAL_SUPPORT", backend)
+            if "collect_device_identity" in user_prompt:
+                return ModelResult('{"collect_device_identity":false}', backend)
+            return ModelResult('{"subject":"Support request","to":"support@example.com","body":"Support request."}', backend)
+
+    service = AgentService(provider=SupportProvider())
+    events: list[AgentEvent] = []
+    with tempfile.TemporaryDirectory() as tmp:
+        original_reports = agent_service_module.REPORTS_ROOT
+        original_tickets = ticketing_service.TICKETS_ROOT
+        agent_service_module.REPORTS_ROOT = Path(tmp) / "reports"
+        ticketing_service.TICKETS_ROOT = Path(tmp) / "tickets"
+        try:
+            service.run(
+                "My company subscription has disappeared.",
+                "cloud",
+                events.append,
+                lambda action, message, reason: ApprovalResponse("no", ""),
+                lambda action, message, reason: ApprovalResponse("no", ""),
+            )
+        finally:
+            agent_service_module.REPORTS_ROOT = original_reports
+            ticketing_service.TICKETS_ROOT = original_tickets
+    assert any(event.kind == "ticket" for event in events)
+    assert not any(event.kind == "classification" and "UNSUPPORTED" in event.message for event in events)
+    assert not any(event.kind == "internal_error" for event in events)
+
+
+def test_device_identity_capability_is_exposed_and_safe_metadata_is_defined():
+    service = AgentService(provider=FakeProvider())
+    assert "get_device_identity" in service.capabilities
+    tool = service.capabilities["get_device_identity"]
+    assert tool.category == "DIAGNOSTIC"
+    assert tool.requires_approval is False

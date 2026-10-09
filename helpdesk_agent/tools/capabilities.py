@@ -118,6 +118,31 @@ def _ps_quote(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
+# ------------------------- Support identity ---------------------------
+
+@capability(
+    "get_device_identity",
+    "DIAGNOSTIC",
+    "Collect the Windows device identity details that are useful for a support ticket: computer name, manufacturer/model, BIOS serial number and hardware UUID when available.",
+)
+def get_device_identity(_: dict[str, Any]) -> ToolResult:
+    if os.name != "nt":
+        return ToolResult(False, "Device identity collection is supported only on Windows.")
+    script = r"""
+$computer = Get-CimInstance Win32_ComputerSystem
+$bios = Get-CimInstance Win32_BIOS
+$product = Get-CimInstance Win32_ComputerSystemProduct
+[PSCustomObject]@{
+    ComputerName = $env:COMPUTERNAME
+    Manufacturer = $computer.Manufacturer
+    Model = $computer.Model
+    SerialNumber = $bios.SerialNumber
+    DeviceUUID = $product.UUID
+} | Format-List | Out-String
+"""
+    return _ps(script)
+
+
 # ------------------------------ Network ------------------------------
 
 @capability(

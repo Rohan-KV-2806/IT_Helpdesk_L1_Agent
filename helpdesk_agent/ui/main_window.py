@@ -163,7 +163,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("L1 Agent")
-        self.setFixedSize(620, 430)
+        self.setMinimumSize(760, 560)
         self.settings = load_settings()
         self.service = AgentService()
         self.worker: AgentWorker | None = None
@@ -177,9 +177,14 @@ class MainWindow(QMainWindow):
         layout.setSpacing(9)
 
         title_row = QHBoxLayout()
-        title = QLabel("L1 Agent")
+        title_box = QVBoxLayout()
+        title = QLabel("L1 IT Helpdesk Agent")
         title.setObjectName("title")
-        title_row.addWidget(title)
+        subtitle = QLabel("Windows L1 troubleshooting • support escalation • guided fixes")
+        subtitle.setObjectName("subtitle")
+        title_box.addWidget(title)
+        title_box.addWidget(subtitle)
+        title_row.addLayout(title_box)
         title_row.addStretch()
         close_btn = QPushButton("×")
         close_btn.setObjectName("closeButton")
@@ -189,7 +194,7 @@ class MainWindow(QMainWindow):
         layout.addLayout(title_row)
 
         controls = QHBoxLayout()
-        self.problem_label = QLabel("Problem: waiting for request")
+        self.problem_label = QLabel("Ready for your request")
         self.problem_label.setObjectName("problem")
         controls.addWidget(self.problem_label, 1)
         self.backend = QComboBox()
@@ -199,8 +204,9 @@ class MainWindow(QMainWindow):
         self.backend.setCurrentIndex(1 if current_backend == "lm_studio" else 0)
         self.backend.setFixedWidth(105)
         controls.addWidget(self.backend)
-        self.ai_settings = QPushButton("AI Settings")
-        self.ai_settings.setFixedWidth(96)
+        self.ai_settings = QPushButton("⚙  AI Settings")
+        self.ai_settings.setFixedWidth(118)
+        self.ai_settings.setObjectName("settingsButton")
         self.ai_settings.clicked.connect(self.open_ai_settings)
         controls.addWidget(self.ai_settings)
         layout.addLayout(controls)
@@ -212,12 +218,13 @@ class MainWindow(QMainWindow):
 
         composer = QHBoxLayout()
         self.input = QPlainTextEdit()
-        self.input.setPlaceholderText("Type here")
-        self.input.setFixedHeight(43)
+        self.input.setPlaceholderText("Describe your IT problem…  e.g. “My memory is overloaded” or “My subscription disappeared”")
+        self.input.setFixedHeight(58)
         self.input.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         composer.addWidget(self.input, 1)
-        self.send = QPushButton("send")
-        self.send.setFixedSize(80, 43)
+        self.send = QPushButton("Send  ➤")
+        self.send.setFixedSize(105, 58)
+        self.send.setObjectName("sendButton")
         self.send.clicked.connect(self.start_agent)
         composer.addWidget(self.send)
         layout.addLayout(composer)
@@ -226,15 +233,23 @@ class MainWindow(QMainWindow):
     def _style(self):
         self.setStyleSheet(
             """
-        QWidget { background: #fbfaf8; color: #262626; font-family: "Segoe UI"; font-size: 12px; }
-        #title { background: #ffffff; border: 1px solid #1f1f1f; padding: 5px 9px; font-size: 16px; font-weight: 650; }
-        #closeButton, #send { background: #ffffff; border: 1px solid #1f1f1f; color: #1f1f1f; font-size: 14px; }
-        #closeButton:hover, #send:hover { background: #f0efec; }
-        #problem { background: #ffffff; border: 1px solid #555555; padding: 6px 10px; font-size: 13px; }
-        QComboBox { background: #ffffff; border: 1px solid #555555; padding: 6px 8px; }
-        QComboBox::drop-down { border: none; width: 22px; }
-        #chat { background: #ffffff; border: 1px solid #555555; padding: 8px; }
-        QPlainTextEdit { background: #ffffff; border: 1px solid #555555; padding: 8px 10px; }
+        QWidget { background: #f5f7fb; color: #172033; font-family: "Segoe UI"; font-size: 12px; }
+        #title { color: #172033; font-size: 20px; font-weight: 700; padding: 0; }
+        #subtitle { color: #667085; font-size: 11px; padding-top: 1px; }
+        #closeButton { background: transparent; border: none; color: #667085; font-size: 22px; border-radius: 8px; }
+        #closeButton:hover { background: #e9edf5; color: #172033; }
+        #problem { background: #ffffff; border: 1px solid #d7ddea; border-radius: 10px; padding: 8px 12px; color: #475467; font-size: 12px; }
+        QComboBox { background: #ffffff; border: 1px solid #d7ddea; border-radius: 9px; padding: 7px 10px; color: #344054; }
+        QComboBox:hover { border-color: #98a2b3; }
+        QComboBox::drop-down { border: none; width: 24px; }
+        #settingsButton { background: #ffffff; border: 1px solid #d7ddea; border-radius: 9px; padding: 7px 10px; color: #344054; font-weight: 600; }
+        #settingsButton:hover { background: #eef2f8; border-color: #98a2b3; }
+        #chat { background: #ffffff; border: 1px solid #d7ddea; border-radius: 12px; padding: 12px; selection-background-color: #dbeafe; }
+        QPlainTextEdit { background: #ffffff; border: 1px solid #d7ddea; border-radius: 11px; padding: 10px 12px; color: #172033; }
+        QPlainTextEdit:focus { border: 1px solid #7c8db5; }
+        #sendButton { background: #172033; border: 1px solid #172033; border-radius: 11px; color: #ffffff; font-size: 13px; font-weight: 700; }
+        #sendButton:hover { background: #2b3852; }
+        #sendButton:disabled { background: #aab2c0; border-color: #aab2c0; }
         """
         )
 
@@ -337,7 +352,7 @@ class MainWindow(QMainWindow):
         self.settings = load_settings()
         self.worker = None
         self.input.setFocus()
-        self.problem_label.setText("Problem: waiting for request")
+        self.problem_label.setText("Ready for your request")
 
     @Slot()
     def open_ai_settings(self):
