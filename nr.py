@@ -12,11 +12,10 @@ label = tk.Label(
 label.pack(expand=True)
 
 def freeze():
-    # Intentionally freeze the GUI thread
+
     while True:
         pass
 
-# Give Windows time to display the window first
 root.after(2000, freeze)
 
 root.mainloop()
